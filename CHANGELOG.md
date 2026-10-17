@@ -5,6 +5,11 @@ documents and is not a claim that the library has been implemented.
 
 ## Unreleased
 
+### Changed
+
+- Use Node.js 24-based GitHub Actions and pin CI and release runners to
+  Ubuntu 24.04, avoiding deprecated action runtimes and automatic image migration.
+
 ### Added
 
 - Initial README and documentation of the library's scope and responsibility
