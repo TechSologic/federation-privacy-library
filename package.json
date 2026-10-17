@@ -1,0 +1,58 @@
+{
+  "name": "@techsologic/federation-privacy-library",
+  "version": "0.1.0-alpha.1",
+  "type": "module",
+  "description": "Federated address discovery and encrypted data transport.",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TechSologic/federation-privacy-library.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js"
+    },
+    "./adapters/memory": {
+      "types": "./dist/adapters/memory.d.ts",
+      "import": "./dist/adapters/memory.js"
+    },
+    "./protocol": {
+      "types": "./dist/protocol/index.d.ts",
+      "import": "./dist/protocol/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "NOTICE.md",
+    "README.md",
+    "docs/runtime.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "format:check": "prettier --check src test scripts examples package.json tsconfig*.json .prettierrc.json .github/workflows/*.yml",
+    "test": "npm run test:release && tsc -p tsconfig.test.json && node scripts/run-tests.mjs unit e2e",
+    "test:release": "node --test test/release.test.mjs",
+    "test:unit": "tsc -p tsconfig.test.json && node scripts/run-tests.mjs unit",
+    "test:e2e": "tsc -p tsconfig.test.json && node scripts/run-tests.mjs e2e",
+    "test:tor": "tsc -p tsconfig.test.json && node scripts/run-tests.mjs tor",
+    "example": "npm run build && node examples/two-nodes.mjs",
+    "prepack": "npm run build",
+    "release:check": "node scripts/check-release.mjs",
+    "release:pack": "node scripts/pack-release.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "prettier": "3.6.2",
+    "typescript": "5.9.3"
+  }
+}

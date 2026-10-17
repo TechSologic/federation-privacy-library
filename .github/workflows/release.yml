@@ -1,0 +1,79 @@
+name: npm release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      publish: ${{ steps.metadata.outputs.publish }}
+      dist-tag: ${{ steps.metadata.outputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Validate release metadata and publishing gate
+        id: metadata
+        env:
+          NPM_PUBLISH_ENABLED: ${{ vars.NPM_PUBLISH_ENABLED }}
+        run: node scripts/check-release.mjs
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run format:check
+      - run: npm test
+      - run: npm run example
+      - name: Build, inspect, and install the release package
+        run: npm run release:pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: .release/package.tgz
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: validate
+    if: >-
+      needs.validate.outputs.publish == 'true' &&
+      github.event_name == 'push' && github.ref_type == 'tag' &&
+      github.repository == 'TechSologic/federation-privacy-library'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@11
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: .release
+      - name: Publish the validated artifact using OIDC
+        env:
+          NPM_DIST_TAG: ${{ needs.validate.outputs.dist-tag }}
+        run: >-
+          npm publish .release/package.tgz --access public
+          --tag "$NPM_DIST_TAG" --ignore-scripts
+          --registry https://registry.npmjs.org
