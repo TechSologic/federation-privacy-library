@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { releaseMetadata } from "../scripts/check-release.mjs";
 
@@ -101,4 +102,21 @@ test("invalid versions, package names, and repository metadata fail closed", () 
   manifest.name = lock.name;
   manifest.repository.url = "git+https://github.com/someone/other.git";
   assert.throws(() => releaseMetadata(manifest, lock, env), /repository/);
+});
+
+test("release workflow pins third-party actions and verifies the validated package", () => {
+  const workflow = readFileSync(
+    new URL("../.github/workflows/release.yml", import.meta.url),
+    "utf8",
+  );
+  const actions = [...workflow.matchAll(/^\s*-\s+uses:\s*([^\s#]+)/gm)].map((match) => match[1]);
+  assert.ok(actions.length >= 4);
+  for (const action of actions) {
+    assert.match(action, /^[^@\s]+@[0-9a-f]{40}$/);
+  }
+  assert.match(workflow, /npm install --global npm@11\.21\.0/);
+  assert.match(
+    workflow,
+    /echo "\$EXPECTED_SHA256  \.release\/package\.tgz" \| sha256sum --check --strict/,
+  );
 });

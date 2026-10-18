@@ -60,5 +60,5 @@ An acceptance for a different project does not automatically cover this one.
   future contributions. Silence or a preselected checkbox is not acceptance.
 
 These checks can be handled manually; no CLA bot is required. Follow the
-[acceptance-record procedure](docs/legal/cla-records.md) and
-[repository setup checklist](docs/maintainers/repository-setup.md).
+[acceptance-record procedure](docs/developing-library/legal/cla-records.md) and
+[repository setup checklist](docs/developing-library/maintainers/repository-setup.md).

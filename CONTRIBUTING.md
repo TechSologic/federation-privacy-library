@@ -1,10 +1,9 @@
 # Contributing
 
 Federation Privacy Library is stewarded by TechSologic Inc. Contributions are
-welcome through this repository's issues and pull requests. The project is
-currently provides an experimental implementation and public contract. The API
-is still evolving; see [runtime status](docs/runtime.md) for supported behavior
-and remaining compatibility work.
+welcome through this repository's issues and pull requests. The API is experimental; see the
+[architecture](docs/using-library/architecture.md) and
+[runtime contracts](docs/using-library/runtime.md) for supported behavior and limits.
 
 ## Contribution Terms
 
@@ -27,7 +26,7 @@ A recorded acceptance covers the accepting PR and future contributions to this
 project under those terms. Acceptance for UnoLock Federated Node does not by
 itself cover Federation Privacy Library. Maintainers verify coverage for each
 author before merging; contributors should not have to repeat covered acceptance
-for every PR. The [recording procedure](docs/legal/cla-records.md) describes the
+for every PR. The [recording procedure](docs/developing-library/legal/cla-records.md) describes the
 evidence to retain.
 
 No CLA is needed simply to report an issue, discuss an idea, use the software,
@@ -35,8 +34,8 @@ or maintain an independent fork.
 
 ## Contribution Workflow
 
-1. Read the [design baseline](docs/design/library-contract.md), the relevant
-   documentation, and the [security invariants](docs/security/invariants.md).
+1. Read the [library contract](docs/developing-library/design/library-contract.md), the relevant
+   documentation, and the [security invariants](docs/developing-library/security/invariants.md).
 2. For a substantial interface or protocol proposal, describe the use case,
    responsibility boundary, alternatives, compatibility, and acceptance criteria
    before expanding the implementation.
@@ -67,7 +66,7 @@ raw traffic captures, and identifying runtime data out of public material.
 
 For documentation-only changes, check local links, examples, terminology, and
 claims against the repository. For implementation changes, run the checks in
-[DEVELOPING.md](DEVELOPING.md) and report the results actually observed.
+[development guide](docs/developing-library/development.md) and report the results actually observed.
 
 Report suspected vulnerabilities through [SECURITY.md](SECURITY.md).
 Participation follows [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md). See

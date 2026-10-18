@@ -1,9 +1,18 @@
 import { randomUUID } from "node:crypto";
-import type { FederationStorage, StateRecord, Stored, StorageMutation } from "./contracts.js";
+import type {
+  FederationStorage,
+  StateRecord,
+  StorageFence,
+  Stored,
+  StorageMutation,
+} from "./contracts.js";
 import { fail } from "./errors.js";
 
 export class State {
-  constructor(readonly storage: FederationStorage) {}
+  constructor(
+    readonly storage: FederationStorage,
+    private readonly activeFence: () => StorageFence,
+  ) {}
   async get<T>(collection: string, key: string): Promise<Stored<T> | null> {
     const record = await this.storage.state.get({ collection, key });
     return record ? { revision: record.revision, value: this.decode<T>(record.value) } : null;
@@ -45,10 +54,14 @@ export class State {
     value: unknown,
     dueAt?: number,
   ): Promise<string | null> {
-    const result = await this.storage.commit(randomUUID(), [
+    const result = await this.commit([
       this.mutation(collection, key, expectedRevision, value, dueAt),
     ]);
+    if (result.outcome === "fenced") fail("storage", "Runtime storage ownership changed");
     return result.outcome === "committed" ? result.revisions[0] : null;
+  }
+  async commit(changes: readonly StorageMutation[]) {
+    return this.storage.commit(randomUUID(), changes, this.activeFence());
   }
   async *scan<T>(
     collection: string,

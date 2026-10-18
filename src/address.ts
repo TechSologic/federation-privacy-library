@@ -51,7 +51,8 @@ export async function destinationIdentity(destination: Destination): Promise<Add
     fail("invalid-data", "Invalid address commitment");
   return { ...destination };
 }
-export function verifyAddressKeys(identity: AddressIdentity, keys: AddressKeys): void {
+/** Validate address-bound public keys and discard keys without an address commitment. */
+export function verifyAddressKeys(identity: AddressIdentity, keys: AddressKeys): AddressKeys {
   if (fingerprint(keys.publicKey) !== identity.encryptionFingerprint)
     fail("unauthorized", "Encryption key commitment mismatch");
   if (
@@ -67,22 +68,21 @@ export function verifyAddressKeys(identity: AddressIdentity, keys: AddressKeys):
     ids.add(key.id);
     fingerprint(key.validationKey, true);
   }
-  if (
-    !keys.validationKeys.some(
-      (key) => fingerprint(key.validationKey, true) === identity.validationFingerprint,
-    )
-  )
-    fail("unauthorized", "Validation key commitment mismatch");
+  const committed = keys.validationKeys.filter(
+    (key) => fingerprint(key.validationKey, true) === identity.validationFingerprint,
+  );
+  if (committed.length !== 1) fail("unauthorized", "Validation key commitment mismatch");
+  return { publicKey: keys.publicKey, validationKeys: [committed[0]!] };
 }
 export async function validateLocalAddress(record: LocalAddress): Promise<LocalAddress> {
   const copy = structuredClone(record);
   await destinationIdentity(copy.identity);
-  verifyAddressKeys(copy.identity, copy.keys);
+  const keys = verifyAddressKeys(copy.identity, copy.keys);
   if (typeof copy.enabled !== "boolean" || typeof copy.policy?.allowAttachments !== "boolean")
     fail("invalid-data", "Invalid address policy");
   integer(copy.policy.maxAttachmentBytes, 0, 5 * 1024 ** 3);
   if (copy.expiresAt !== undefined) integer(copy.expiresAt, 1);
-  return copy;
+  return { ...copy, keys };
 }
 export function onion(value: string): string {
   if (typeof value !== "string" || !/^http:\/\/[a-z2-7]{56}\.onion(?::[0-9]{1,5})?$/.test(value))

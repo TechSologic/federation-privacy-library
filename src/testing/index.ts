@@ -1,6 +1,9 @@
+import { FederationFacade } from "../federation.js";
+import type { FederationConfiguration as PublicConfiguration } from "../api.js";
 import type { Federation, FederationConfiguration } from "../contracts.js";
-import { FederationRuntime } from "../runtime.js";
+import { FederationRuntime, type RuntimeHooks } from "../runtime.js";
 import { localConnect } from "../transport.js";
+import type { Connector } from "../transport.js";
 import { fail } from "../errors.js";
 import { integer } from "../errors.js";
 import { onion } from "../address.js";
@@ -25,27 +28,71 @@ export class TestNetwork {
     integer(port, 1, 65535);
     this.ports.set(endpoint, port);
   }
-  create(config: FederationConfiguration): Federation {
-    return new FederationRuntime(
-      config,
+  connector(): Connector {
+    return {
+      connect: async (endpoint, signal) => {
+        const port = this.ports.get(endpoint);
+        if (!port || this.blocked.has(endpoint)) fail("unavailable", "Test peer is offline", true);
+        return localConnect("127.0.0.1", port, signal);
+      },
+    };
+  }
+  create(config: PublicConfiguration): FederationFacade {
+    return new FederationFacade(config, (runtimeConfig) => this.instantiate(runtimeConfig));
+  }
+  /** Adapts pre-facade regression fixtures; still exercises the public facade. */
+  createRuntime(config: FederationConfiguration, hooks: RuntimeHooks = {}): Federation {
+    return new FederationFacade(
       {
-        connect: async (endpoint, signal) => {
-          const port = this.ports.get(endpoint);
-          if (!port || this.blocked.has(endpoint))
-            fail("unavailable", "Test peer is offline", true);
-          return localConnect("127.0.0.1", port, signal);
+        storage: {
+          addresses: config.storage.addresses,
+          state: config.storage.state,
+          lease: config.storage.lease,
+          commit: config.storage.commit.bind(config.storage),
+          sources: config.sources,
+          archives: config.archives?.store,
+        },
+        tor: config.tor,
+        limits: config.limits,
+        handlers: {
+          messages: config.messages?.receiver,
+          archives: config.archives?.receiver,
+          authorization: config.authorization,
+          proofs: config.proofs,
+          routes: config.routes,
+          onEvent: (event) => {
+            if (event.type === "runtime") return config.listener?.onState(event.status);
+          },
         },
       },
-      {
-        pollMs: 10,
-        retryMs: 30,
-        onListening: (port) => {
-          this.ports.set(config.tor.onionService, port);
-        },
-        onStopped: () => {
-          this.ports.delete(config.tor.onionService);
-        },
-      },
+      (runtimeConfig) => this.instantiate(runtimeConfig, hooks),
     );
   }
+  private instantiate(config: FederationConfiguration, hooks: RuntimeHooks = {}): Federation {
+    return new FederationRuntime(config, this.connector(), {
+      pollMs: 10,
+      retryMs: 30,
+      ...hooks,
+      onListening: (port) => {
+        this.ports.set(config.tor.onionService, port);
+        hooks.onListening?.(port);
+      },
+      onStopped: () => {
+        this.ports.delete(config.tor.onionService);
+        hooks.onStopped?.();
+      },
+    });
+  }
 }
+
+/** Internal engine fixtures for compatibility tests. Production applications use createFederation. */
+export * from "../delivery/index.js";
+export * from "../dht/index.js";
+export { FederationLookupRpcClient } from "../protocol/lookupRpcClient.js";
+export type {
+  FederationLookupRpcClientOptions,
+  FederationLookupRpcHttpTransport,
+  FederationReceiveAddressPublicKey,
+} from "../protocol/lookupRpcClient.js";
+export { FederationLookupCoordinator } from "../host/lookup.js";
+export type { FederationLookupCoordinatorOptions } from "../host/lookup.js";

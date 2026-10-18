@@ -1,10 +1,89 @@
-export type * from "./contracts.js";
-export { generateAddress, deriveAddress, validateAddress } from "./address.js";
+export type {
+  ByteStream,
+  AddressHash,
+  OperationId,
+  Revision,
+  SourceId,
+  CallOptions,
+  PageRequest,
+  Page,
+  ByteRange,
+  CiphertextInfo,
+  ArchiveInfo,
+  DataSource,
+  SourceResolver,
+  AddressIdentity,
+  Destination,
+  ValidationKey,
+  AddressKeys,
+  DeliveryPolicy,
+  LocalAddress,
+  Stored,
+  PublicationState,
+  AddressRegistration,
+  ResolvedAddress,
+  AddressStore,
+  StateKey,
+  StateRecord,
+  FederationStateStore,
+  StorageMutation,
+  StorageCommit,
+  StorageFence,
+  FederationLeaseStore,
+  TransferFailure,
+  TransferState,
+  TransferSnapshot,
+  TransferEvent,
+  TransferListener,
+  TransferResult,
+  TransferOutcome,
+  Transfer,
+  TransferApi,
+  SendOptions,
+  SubmissionError,
+  EncryptedMessage,
+  MessageMetadata,
+  ReceiveError,
+  MessageReceiver,
+  ArchiveReference,
+  ArchiveCollection,
+  ProtocolDocument,
+  ArchiveDescription,
+  ArchiveList,
+  ArchiveSource,
+  ArchiveReceiveMetadata,
+  ArchiveReceiver,
+  ArchiveReadReceiver,
+  ArchiveVersion,
+  VersionCommit,
+  ArchiveRequestOptions,
+  ArchiveHeadFreshness,
+  ArchiveHeadOptions,
+  ArchiveReadOptions,
+  ArchiveApi,
+  ArchiveStoreCall,
+  ArchiveStore,
+  AuthorizedOperation,
+  AuthorizationRequest,
+  TrustedAuthority,
+  AuthorizationHandler,
+  ProofProvider,
+  AddressRouteProofProvider,
+  TorConfiguration,
+  RuntimeStatus,
+  RuntimeListener,
+  FederationLimits,
+} from "./contracts.js";
+export type * from "./api.js";
+export type { FederationFacade as Federation } from "./federation.js";
+export type AddressApi = FederationFacade["addresses"];
+export type MessageApi = FederationFacade["messages"];
 export { FederationError } from "./errors.js";
-import type { Federation, FederationConfiguration } from "./contracts.js";
-import { FederationRuntime } from "./runtime.js";
-import { torConnector } from "./transport.js";
-/** Uses a separately operated Tor process; never falls back to direct networking. */
-export function createFederation(config: FederationConfiguration): Federation {
-  return new FederationRuntime(config, torConnector(config.tor));
+export { FederationSubmissionError } from "./submission.js";
+export { generateAddress, deriveAddress, validateAddress } from "./address.js";
+export * as protocol from "./protocol/index.js";
+import type { FederationConfiguration } from "./api.js";
+import { FederationFacade } from "./federation.js";
+export function createFederation(config: FederationConfiguration): FederationFacade {
+  return new FederationFacade(config);
 }

@@ -15,6 +15,7 @@ import {
   object,
   replicaLeaseMs,
   type LookupRecord,
+  validateLookupEnvelope,
 } from "./protocol/lookup.js";
 
 interface Replica {
@@ -23,6 +24,11 @@ interface Replica {
 }
 export interface Publication extends Replica {
   published: boolean;
+}
+interface PinnedKeys {
+  keys: ResolvedAddress["keys"];
+  policy: ResolvedAddress["policy"];
+  archiveOnionService?: string;
 }
 const outbound = new DhtAdmission(32);
 export class Discovery {
@@ -113,7 +119,7 @@ export class Discovery {
   }
   async putReplica(addressHash: string, encoded: string): Promise<number> {
     hashAddress(addressHash);
-    base64(encoded, 4096);
+    validateLookupEnvelope(encoded, addressHash);
     const local = await this.state.storage.addresses.get(addressHash);
     if (local) {
       const owned = await this.state.get<Publication>("publication", addressHash);
@@ -151,7 +157,8 @@ export class Discovery {
           (count?.value ?? 0) + 1,
         ),
       );
-    const result = await this.state.storage.commit(crypto.randomUUID(), mutations);
+    const result = await this.state.commit(mutations);
+    if (result.outcome === "fenced") fail("storage", "Runtime storage ownership changed");
     if (result.outcome === "conflict") fail("unavailable", "Lookup replica busy", true);
     return now;
   }
@@ -191,7 +198,8 @@ export class Discovery {
     signal: AbortSignal,
   ): Promise<{ resolved: ResolvedAddress; record: LookupRecord } | null> {
     const hash = identity.addressHash;
-    let value = await this.findLocal(hash);
+    const pin = await this.state.get<Replica>("lookup-pin", hash);
+    let value = pin?.value ?? (await this.findLocal(hash));
     if (!value) {
       const result = await walkDht<Replica>({
         target: hash,
@@ -218,7 +226,7 @@ export class Discovery {
           this.table.verified(contact);
           if (r.found) {
             integer(r.storedAt, 1);
-            decodeLookup(r.lookupValue, hash);
+            validateLookupEnvelope(r.lookupValue, hash);
             if (r.storedAt > Date.now() + 60_000 || r.storedAt + replicaLeaseMs <= Date.now())
               fail("invalid-data", "Expired lookup response");
             return { contacts: [], value: { encoded: r.lookupValue, storedAt: r.storedAt } };
@@ -232,7 +240,27 @@ export class Discovery {
         fail("unavailable", "Federation lookup could not complete", true);
       value = result.value;
     }
-    const record = decodeLookup(value.encoded, hash);
+    // Verify before committing. A replica alone is never a trusted pin.
+    decodeLookup(value.encoded, hash, identity.validationFingerprint);
+    if (!pin) {
+      value = await this.pin("lookup-pin", hash, value);
+    }
+    const record = decodeLookup(value.encoded, hash, identity.validationFingerprint);
+    const cached = await this.state.get<PinnedKeys>("key-pin", hash);
+    const result = (pinned: PinnedKeys) => ({
+      record,
+      resolved: {
+        identity,
+        keys: verifyAddressKeys(identity, pinned.keys),
+        policy: pinned.policy,
+        expiresAt: record.expiresAt,
+        routes: {
+          messageOnionService: record.targets[0]!.onionService,
+          archiveOnionService: pinned.archiveOnionService ?? record.targets[0]!.onionService,
+        },
+      },
+    });
+    if (cached) return result(cached.value);
     let missing = 0;
     for (const target of record.targets) {
       try {
@@ -269,33 +297,52 @@ export class Discovery {
           missing++;
           continue;
         }
-        const keys = { publicKey: r.publicKey, validationKeys: r.validationKeys };
-        verifyAddressKeys(identity, keys);
+        const keys = verifyAddressKeys(identity, {
+          publicKey: r.publicKey,
+          validationKeys: r.validationKeys,
+        });
         if (typeof r.allowAttachments !== "boolean")
           fail("invalid-data", "Invalid attachment policy");
         integer(r.maxAttachmentBytes, 0, 5 * 1024 ** 3);
         if (r.attachmentGatewayOnionService !== undefined) onion(r.attachmentGatewayOnionService);
-        return {
-          record: { ...record, targets: [target, ...record.targets.filter((t) => t !== target)] },
-          resolved: {
-            identity,
-            keys,
-            policy: {
-              allowAttachments: r.allowAttachments,
-              maxAttachmentBytes: r.maxAttachmentBytes,
-            },
-            expiresAt: value.storedAt + replicaLeaseMs,
-            routes: {
-              messageOnionService: target.onionService,
-              archiveOnionService: r.attachmentGatewayOnionService ?? target.onionService,
-            },
+        const pinned = await this.pin<PinnedKeys>("key-pin", hash, {
+          keys,
+          policy: {
+            allowAttachments: r.allowAttachments,
+            maxAttachmentBytes: r.maxAttachmentBytes,
           },
-        };
+          archiveOnionService: r.attachmentGatewayOnionService ?? target.onionService,
+        });
+        return result(pinned);
       } catch {
         signal.throwIfAborted();
       }
     }
     if (missing === record.targets.length) return null;
     fail("unavailable", "No verified destination is reachable", true);
+  }
+
+  private async pin<T>(collection: "lookup-pin" | "key-pin", hash: string, value: T): Promise<T> {
+    // Pins are trust state, not disposable performance caches. At capacity,
+    // reject new bindings instead of forgetting an existing one.
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const existing = await this.state.get<T>(collection, hash);
+      if (existing) return existing.value;
+      const count = await this.state.get<number>("capacity", collection);
+      if ((count?.value ?? 0) >= 4096)
+        fail("limit-exceeded", "Verified lookup pin capacity reached");
+      const committed = await this.state.commit([
+        this.state.mutation(collection, hash, null, value),
+        this.state.mutation(
+          "capacity",
+          collection,
+          count?.revision ?? null,
+          (count?.value ?? 0) + 1,
+        ),
+      ]);
+      if (committed.outcome === "fenced") fail("storage", "Runtime storage ownership changed");
+      if (committed.outcome === "committed") return value;
+    }
+    fail("unavailable", "Verified lookup pin storage busy", true);
   }
 }

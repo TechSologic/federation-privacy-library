@@ -13,6 +13,7 @@ import type { ByteStream, TorConfiguration } from "./contracts.js";
 import { onion } from "./address.js";
 import { collect } from "./streams.js";
 import { fail, FederationError, integer } from "./errors.js";
+import { lookupRequestMaxBytes } from "./protocol/lookup.js";
 
 export interface WireRequest {
   method?: "GET" | "POST" | "PUT";
@@ -21,6 +22,8 @@ export interface WireRequest {
   headers?: Record<string, string>;
   signal: AbortSignal;
   maxResponseBytes?: number;
+  /** Archive is reserved for routes that stream archive object bytes. */
+  deadlineClass?: "control" | "archive";
 }
 export interface WireResponse {
   status: number;
@@ -43,6 +46,23 @@ export type WireHandler = (request: {
   headers?: Record<string, string>;
 }>;
 
+export interface WireDeadlines {
+  readonly controlMs: number;
+  readonly archiveMs: number;
+}
+
+const defaultDeadlines: WireDeadlines = {
+  controlMs: 60_000,
+  archiveMs: 24 * 60 * 60_000,
+};
+const archiveStreamPaths = new Set([
+  "/federation/v1/archive/object",
+  "/federation/v1/archive/object/read",
+  "/federation/v1/archive/multipart/part",
+]);
+const deadlineClass = (path: string): "control" | "archive" =>
+  archiveStreamPaths.has(path) ? "archive" : "control";
+
 export class HttpWire {
   private server?: Server;
   private readonly agents = new Set<Agent>();
@@ -50,7 +70,18 @@ export class HttpWire {
   constructor(
     readonly connector: Connector,
     private readonly config: TorConfiguration,
-  ) {}
+    deadlines: number | WireDeadlines = defaultDeadlines,
+  ) {
+    this.deadlines =
+      typeof deadlines === "number" ? { controlMs: deadlines, archiveMs: deadlines } : deadlines;
+    integer(this.deadlines.controlMs, 100, defaultDeadlines.controlMs);
+    integer(this.deadlines.archiveMs, 100, defaultDeadlines.archiveMs);
+  }
+  private readonly deadlines: WireDeadlines;
+  private deadline(path: string, requested?: "control" | "archive"): number {
+    const kind = requested ?? deadlineClass(path);
+    return kind === "archive" ? this.deadlines.archiveMs : this.deadlines.controlMs;
+  }
   async start(handler: WireHandler): Promise<number> {
     if (this.server) fail("conflict", "Listener already started");
     this.server = createServer({ maxHeaderSize: 16 * 1024 }, (req, res) => {
@@ -65,14 +96,16 @@ export class HttpWire {
         return;
       }
       const control = new AbortController();
+      const signal = AbortSignal.any([
+        control.signal,
+        AbortSignal.timeout(this.deadline(req.url ?? "")),
+      ]);
       this.requests.add(control);
       req.once("aborted", () => control.abort());
       res.once("close", () => {
         if (!res.writableFinished) control.abort();
       });
-      void this.respond(req, res, control.signal, handler).finally(() =>
-        this.requests.delete(control),
-      );
+      void this.respond(req, res, signal, handler).finally(() => this.requests.delete(control));
     });
     this.server.maxHeadersCount = 64;
     this.server.maxConnections = 64;
@@ -96,6 +129,7 @@ export class HttpWire {
     signal: AbortSignal,
     handler: WireHandler,
   ) {
+    let operation: ReturnType<WireHandler> | undefined;
     try {
       const path = req.url ?? "";
       if (!path.startsWith("/") || path.includes("?") || path.includes("#"))
@@ -103,13 +137,14 @@ export class HttpWire {
       const headers: Record<string, string> = {};
       for (const [name, value] of Object.entries(req.headers))
         if (typeof value === "string") headers[name] = value;
-      const result = await handler({
+      operation = handler({
         path,
         method: req.method ?? "",
         headers,
         signal,
         body: Readable.toWeb(req) as ByteStream,
       });
+      const result = await this.untilAborted(operation, signal);
       res.writeHead(result.status, {
         "content-type": "application/json",
         "cache-control": "no-store",
@@ -155,15 +190,49 @@ export class HttpWire {
       if (!res.headersSent)
         res.writeHead(status, { "content-type": "application/json", connection: "close" });
       res.end(JSON.stringify({ type: status === 503 ? "SERVER" : "VALIDATION" }));
+    } finally {
+      // A deadline closes the peer response, but an adapter may ignore cancellation.
+      // Keep that work admission-counted until it really settles so timed-out calls
+      // cannot accumulate without the fixed request cap.
+      if (signal.aborted && operation) await operation.catch(() => {});
     }
+  }
+  private untilAborted<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const finish = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", abort);
+        callback();
+      };
+      const abort = () =>
+        finish(() =>
+          reject(
+            signal.reason instanceof Error
+              ? signal.reason
+              : new FederationError("unavailable", "Request deadline expired", true),
+          ),
+        );
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+      void operation.then(
+        (value) => finish(() => resolve(value)),
+        (error) => finish(() => reject(error)),
+      );
+    });
   }
   async request(endpoint: string, input: WireRequest): Promise<WireResponse> {
     onion(endpoint);
     input.signal.throwIfAborted();
+    const signal = AbortSignal.any([
+      input.signal,
+      AbortSignal.timeout(this.deadline(input.path, input.deadlineClass)),
+    ]);
     if (!input.path.startsWith("/") || input.path.includes("\r") || input.path.includes("\n"))
       fail("invalid-data", "Invalid protocol path");
     const url = new URL(endpoint);
-    const socket = await this.connector.connect(endpoint, input.signal);
+    const socket = await this.connector.connect(endpoint, signal);
     const agent = new Agent({ keepAlive: false });
     this.agents.add(agent);
     agent.createConnection = (() => socket) as typeof agent.createConnection;
@@ -179,7 +248,7 @@ export class HttpWire {
           path: input.path,
           headers,
           agent,
-          signal: input.signal,
+          signal,
         },
         (response) => {
           const returned: Record<string, string> = {};
@@ -215,17 +284,17 @@ export class HttpWire {
         const abort = () => {
           void reader.cancel().catch(() => {});
         };
-        input.signal.addEventListener("abort", abort, { once: true });
+        signal.addEventListener("abort", abort, { once: true });
         try {
           while (true) {
-            input.signal.throwIfAborted();
+            signal.throwIfAborted();
             const chunk = await reader.read();
             if (chunk.done) break;
-            if (!req.write(chunk.value)) await once(req, "drain", { signal: input.signal });
+            if (!req.write(chunk.value)) await once(req, "drain", { signal });
           }
           req.end();
         } finally {
-          input.signal.removeEventListener("abort", abort);
+          signal.removeEventListener("abort", abort);
           await reader.cancel().catch(() => {});
           reader.releaseLock();
         }
@@ -242,7 +311,8 @@ export class HttpWire {
     maxResponseBytes = 32 * 1024,
   ): Promise<unknown> {
     const payload = Buffer.from(JSON.stringify(body));
-    if (payload.length > 8192) fail("limit-exceeded", "Protocol request too large");
+    if (payload.length > lookupRequestMaxBytes(path))
+      fail("limit-exceeded", "Protocol request too large");
     const result = await this.request(endpoint, {
       path,
       body: payload,
@@ -269,6 +339,7 @@ export class HttpWire {
         server.close(() => resolve());
         server.closeAllConnections();
       });
+    this.requests.clear();
   }
 }
 

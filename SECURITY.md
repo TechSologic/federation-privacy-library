@@ -1,9 +1,9 @@
 # Security Policy
 
-Federation Privacy Library is in initial design and documentation development.
-There is no released library version or supported production release yet.
-Reports about the proposed security boundaries and future implementation are
-welcome; no completed audit or production qualification is asserted.
+Federation Privacy Library is experimental. Production-qualified releases and a
+long-term support policy are not provided. Reports about the implementation,
+public interfaces, provider contracts and security boundaries are welcome.
+No completed independent audit or production qualification is asserted.
 
 ## Reporting
 
@@ -29,8 +29,8 @@ or complete databases.
 
 ## Scope And Review Baseline
 
-Start with the [security invariants](docs/security/invariants.md) and the
-[design baseline](docs/design/library-contract.md).
+Start with the [security invariants](https://github.com/TechSologic/federation-privacy-library/blob/main/docs/developing-library/security/invariants.md) and the
+[library contract](https://github.com/TechSologic/federation-privacy-library/blob/main/docs/developing-library/design/library-contract.md).
 
 Examples of relevant issues include key substitution, authorization bypass,
 replay protection failures, unintended identifying metadata, integrity failures,
@@ -43,13 +43,13 @@ application authorization remain separate responsibilities.
 ## Response And Disclosure
 
 TechSologic maintainers coordinate triage, remediation, and disclosure with
-reporters. Initial development has no guaranteed response or remediation time.
+reporters. The project has no guaranteed response or remediation time.
 Keep undisclosed details private while maintainers assess impact and recovery.
 
 A report against a consumer application may also require coordination with that
 application's maintainers. Do not assume a library change alone resolves every
 affected deployment.
 
-Before a first release, maintainers must define supported versions and document
-the validation and release evidence. See the
-[repository setup checklist](docs/maintainers/repository-setup.md).
+Release maintainers must define supported versions and document validation
+and release evidence. See the
+[repository setup checklist](https://github.com/TechSologic/federation-privacy-library/blob/main/docs/developing-library/maintainers/repository-setup.md).

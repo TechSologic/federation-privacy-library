@@ -2,7 +2,7 @@
 
 Federation Privacy Library is a maintainer-led project stewarded by
 TechSologic Inc. Its scope is the reusable federation library and supporting
-adapters described in the [design baseline](docs/design/library-contract.md).
+adapters described in the [library contract](docs/developing-library/design/library-contract.md).
 
 Software use, modification, and redistribution follow [LICENSE](LICENSE).
 Contributions follow [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -16,14 +16,14 @@ problem, responsibility boundary, alternatives, compatibility assessment, and
 verification plan.
 
 Resolve disagreements with evidence and the
-[security invariants](docs/security/invariants.md). Changes to those boundaries
+[security invariants](docs/developing-library/security/invariants.md). Changes to those boundaries
 need explicit review and a recorded decision. Repository access, sponsorship,
 or a passing check does not replace review.
 
 The intended branch policy requires pull requests and approving review for
 ordinary changes. Actual GitHub protections must be configured separately;
 this file does not establish that they are enabled. See
-[repository setup](docs/maintainers/repository-setup.md).
+[repository setup](docs/developing-library/maintainers/repository-setup.md).
 
 ## Responsibilities And Contribution Rights
 

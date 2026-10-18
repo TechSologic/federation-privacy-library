@@ -27,6 +27,8 @@ export interface ArchiveJob {
   info?: C.ArchiveInfo;
   expectedRevision?: string | null;
   range?: C.ByteRange;
+  expectedInfo?: C.ArchiveInfo;
+  expectedRangeSha256?: string;
   context: Record<string, any>;
 }
 interface MultipartSession {
@@ -50,6 +52,7 @@ interface Host {
   wire: HttpWire;
   limits: C.FederationLimits;
   signal(options?: C.CallOptions): AbortSignal;
+  fence(): C.StorageFence;
   resolve(destination: C.Destination, signal: AbortSignal): Promise<string>;
   enqueue(
     kind: "archive-send" | "archive-read",
@@ -62,6 +65,8 @@ interface Host {
 }
 const payload = (value: unknown) => Buffer.from(JSON.stringify(value));
 const type = (name: string) => `unolock.federation.archive.${name}.request.v1`;
+const maxCursorLength = 4096;
+const archiveContentMarkerLifetimeMs = 5 * 60_000;
 
 export class Archives implements C.ArchiveApi {
   private readonly sources = new Map<string, C.ArchiveSource>();
@@ -76,13 +81,14 @@ export class Archives implements C.ArchiveApi {
     request: unknown,
     options: C.ArchiveRequestOptions,
     signal: AbortSignal,
+    collection?: C.ArchiveCollection,
   ): Promise<any> {
     const provider = options.proofs ?? this.host.config.proofs;
     if (!provider) fail("unauthorized", "An archive proof provider is required");
     const canonicalRequest = canonical(request);
     const result = await provider.provide({
       operation,
-      target: { archive },
+      target: { archive, ...(collection ? { collection } : {}) },
       canonicalRequest,
       requestHash: shaHex(canonicalRequest),
       signal,
@@ -105,11 +111,12 @@ export class Archives implements C.ArchiveApi {
     request: unknown,
     proof: unknown,
     signal: AbortSignal,
-  ): Promise<C.TrustedAuthority> {
+    collection?: C.ArchiveCollection,
+  ): Promise<{ authority: C.TrustedAuthority; collection?: C.ArchiveCollection }> {
     const handler = this.host.config.authorization;
     if (!handler) fail("unauthorized", "Archive access denied");
     const canonicalRequest = canonical(request);
-    const input: C.AuthorizationRequest = {
+    const lookup: C.AuthorizationRequest = {
       operation,
       target: { archive },
       canonicalRequest,
@@ -117,13 +124,28 @@ export class Archives implements C.ArchiveApi {
       submitted: [document(proof)],
       signal,
     };
-    const authority = await handler.resolveAuthority(input);
+    const authority = await handler.resolveAuthority(lookup);
     if (!authority) fail("unauthorized", "Archive access denied");
     verifyRequestProof(proof, authority, wireOperation, archive.id, request);
+    let trustedCollection: C.ArchiveCollection | undefined;
+    if (collection) {
+      const trusted = authority.archiveCollection;
+      if (
+        !trusted ||
+        trusted.id !== collection.id ||
+        trusted.authorityArchiveId !== collection.authorityArchiveId
+      )
+        fail("unauthorized", "Archive collection scope mismatch");
+      trustedCollection = { ...trusted, locator: collection.locator };
+    }
+    const input: C.AuthorizationRequest = {
+      ...lookup,
+      target: { archive, ...(trustedCollection ? { collection: trustedCollection } : {}) },
+    };
     if ((await handler.authorize(input, authority)) !== "allow")
       fail("unauthorized", "Archive access denied");
     signal.throwIfAborted();
-    return authority;
+    return { authority, collection: trustedCollection };
   }
   private async rpc(
     endpoint: string,
@@ -163,13 +185,15 @@ export class Archives implements C.ArchiveApi {
     if (!context.createIntent)
       fail("invalid-data", "Existing protocol createIntent is required in context");
     const ref = { id: archive.id, locator: gatewayLocator(archive.id, endpoint) };
+    const createRequest = context.createIntent;
     const createGrant = await this.proof(
       "archive-create",
       "create",
       ref,
-      context.createIntent,
+      createRequest,
       options,
       signal,
+      input.collection,
     );
     const result = await this.rpc(
       endpoint,
@@ -207,13 +231,17 @@ export class Archives implements C.ArchiveApi {
     const endpoint = await this.host.resolve(destination, signal);
     const ref = { id: collection.authorityArchiveId, locator: collection.locator };
     archiveReference(ref);
+    const cursor =
+      query.cursor === undefined ? undefined : boundedText(query.cursor, maxCursorLength);
+    const listRequest = { authorityArchiveID: ref.id };
     const listGrant = await this.proof(
       "archive-list",
       "list",
       ref,
-      { authorityArchiveID: ref.id },
+      listRequest,
       options,
       signal,
+      collection,
     );
     const result = await this.rpc(
       endpoint,
@@ -223,7 +251,7 @@ export class Archives implements C.ArchiveApi {
         archiveListID: collection.id,
         authorityArchiveID: ref.id,
         listGrant,
-        ...(query.cursor ? { cursor: query.cursor } : {}),
+        ...(cursor ? { cursor } : {}),
       },
       signal,
     );
@@ -240,7 +268,7 @@ export class Archives implements C.ArchiveApi {
       result.archives.length > 64
     )
       fail("invalid-data", "Invalid archive listing");
-    if (result.nextCursor !== undefined) boundedText(result.nextCursor, 8192);
+    if (result.nextCursor !== undefined) boundedText(result.nextCursor, maxCursorLength);
     // The current wire fixes page size at up to 64; truncating it would lose records.
     return {
       outcome: "listed",
@@ -268,7 +296,12 @@ export class Archives implements C.ArchiveApi {
     const context = readDocument(options.context);
     boundedText(context.authorityArchiveID, 256);
     boundedText(context.archiveListID, 256);
-    const request = { authorityArchiveID: context.authorityArchiveID, archiveID: archive.id };
+    const collection: C.ArchiveCollection = {
+      id: context.archiveListID,
+      authorityArchiveId: context.authorityArchiveID,
+      locator: archive.locator,
+    };
+    const request = { authorityArchiveID: collection.authorityArchiveId, archiveID: archive.id };
     const deleteGrant = await this.proof(
       "archive-delete",
       "delete",
@@ -276,11 +309,12 @@ export class Archives implements C.ArchiveApi {
       request,
       options,
       signal,
+      collection,
     );
     const result = await this.rpc(
       endpoint,
       "delete",
-      { type: type("delete"), ...request, archiveListID: context.archiveListID, deleteGrant },
+      { type: type("delete"), ...request, archiveListID: collection.id, deleteGrant },
       signal,
     );
     if (
@@ -292,9 +326,23 @@ export class Archives implements C.ArchiveApi {
   async head(
     destination: C.Destination,
     archive: C.ArchiveReference,
-    options: C.ArchiveRequestOptions = {},
+    options: C.ArchiveHeadOptions,
+  ): Promise<C.ArchiveVersion | null> {
+    if (!options?.freshness) fail("invalid-data", "Archive head freshness is required");
+    if (options.freshness.minimumSequence > 0 && !options.freshness.hashAtMinimum)
+      fail("invalid-data", "A trusted head hash is required for an observed sequence");
+    return this.fetchHead(destination, archive, options, options.freshness);
+  }
+  private async fetchHead(
+    destination: C.Destination,
+    archive: C.ArchiveReference,
+    options: C.ArchiveRequestOptions,
+    freshness: { minimumSequence: number; hashAtMinimum?: string },
   ): Promise<C.ArchiveVersion | null> {
     archiveReference(archive);
+    integer(freshness.minimumSequence, 0);
+    if (freshness.hashAtMinimum && base64(freshness.hashAtMinimum, 32).length !== 32)
+      fail("invalid-data", "Invalid trusted archive head hash");
     const signal = this.host.signal(options);
     const endpoint = await this.host.resolve(destination, signal);
     const access = await this.proof(
@@ -311,13 +359,42 @@ export class Archives implements C.ArchiveApi {
       { type: type("mutable.head"), locator: archive.locator, archiveID: archive.id, access },
       signal,
     );
-    if (result.result === "NOT_FOUND") return null;
+    if (result.result === "NOT_FOUND") {
+      if (freshness.minimumSequence > 0)
+        fail("invalid-data", "Archive head is older than trusted local state");
+      return null;
+    }
     if (result.result === "ARCHIVE_NOT_FOUND") fail("not-found", "Archive was not found");
     if (result.result !== "SUCCESS") fail("invalid-data", "Invalid version response");
     const p = parsePointer(result.pointer, archive.id);
     if (result.pointerHash !== p.pointerHash)
       fail("invalid-data", "Version response hash mismatch");
-    return { hash: p.pointerHash, predecessor: p.previousPointerHash || null, signed: document(p) };
+    const canonicalRequest = canonical({ archiveID: archive.id });
+    const verificationRequest: C.AuthorizationRequest = {
+      operation: "archive-head",
+      target: { archive },
+      canonicalRequest,
+      requestHash: shaHex(canonicalRequest),
+      submitted: [document(p)],
+      signal,
+    };
+    const handler = this.host.config.authorization;
+    const authority = options.authority ?? (await handler?.resolveAuthority(verificationRequest));
+    if (!authority) fail("unauthorized", "Trusted archive head authority is required");
+    const verified = verifyPointer(p, archive.id, undefined, authority);
+    if (
+      verified.sequence < freshness.minimumSequence ||
+      (verified.sequence === freshness.minimumSequence &&
+        freshness.hashAtMinimum !== undefined &&
+        verified.hash !== freshness.hashAtMinimum)
+    )
+      fail("unauthorized", "Archive head is older than trusted local state");
+    if (
+      !options.authority &&
+      (await handler!.authorize(verificationRequest, authority)) !== "allow"
+    )
+      fail("unauthorized", "Archive head was denied");
+    return verified;
   }
   async commitVersion(
     destination: C.Destination,
@@ -345,7 +422,12 @@ export class Archives implements C.ArchiveApi {
       "PUT",
     );
     if (result.result === "CONFLICT")
-      return { outcome: "conflict", current: await this.head(destination, archive, options) };
+      return {
+        outcome: "conflict",
+        current: await this.fetchHead(destination, archive, options, {
+          minimumSequence: pointer.sequence,
+        }),
+      };
     if (result.result !== "SUCCESS" || result.pointerHash !== pointer.pointerHash)
       fail("invalid-data", "Invalid version commit response");
     return {
@@ -353,6 +435,8 @@ export class Archives implements C.ArchiveApi {
       version: {
         hash: pointer.pointerHash,
         predecessor: input.expectedPredecessor,
+        sequence: pointer.sequence,
+        issuedAt: pointer.issuedAt,
         signed: input.signedSuccessor,
       },
     };
@@ -398,12 +482,17 @@ export class Archives implements C.ArchiveApi {
     destination: C.Destination,
     archive: C.ArchiveReference,
     receiver: C.ArchiveReadReceiver,
-    listener?: C.TransferListener,
-    options: C.SendOptions & C.ArchiveRequestOptions & { range?: C.ByteRange } = {},
+    listener: C.TransferListener | undefined,
+    options: C.SendOptions & C.ArchiveRequestOptions & C.ArchiveReadOptions,
   ): Promise<C.Transfer> {
     this.host.signal(options);
     archiveReference(archive);
-    if (options.range) rangeWithin(options.range, this.host.limits.maxArchiveBytes);
+    integer(options.expectedInfo.byteLength, 1, this.host.limits.maxArchiveBytes);
+    if (base64(options.expectedInfo.sha256, 32).length !== 32)
+      fail("invalid-data", "Invalid expected archive digest");
+    if (options.range) rangeWithin(options.range, options.expectedInfo.byteLength);
+    if (options.range && base64(options.expectedRangeSha256, 32).length !== 32)
+      fail("invalid-data", "Invalid expected archive range digest");
     const id = options.operationId ?? randomUUID();
     this.receivers.set(id, receiver);
     if (options.proofs) this.providers.set(id, options.proofs);
@@ -411,10 +500,16 @@ export class Archives implements C.ArchiveApi {
       const transfer = await this.host.enqueue(
         "archive-read",
         destination,
-        { archive, range: options.range, context: readDocument(options.context) },
+        {
+          archive,
+          range: options.range,
+          expectedInfo: options.expectedInfo,
+          expectedRangeSha256: options.range ? options.expectedRangeSha256 : undefined,
+          context: readDocument(options.context),
+        },
         listener,
         { ...options, operationId: id },
-        options.range?.length ?? 0,
+        options.range?.length ?? options.expectedInfo.byteLength,
       );
       if ((await transfer.status()).state === "paused") await transfer.resume();
       return transfer;
@@ -459,6 +554,7 @@ export class Archives implements C.ArchiveApi {
       );
       const response = await this.host.wire.request(endpoint, {
         path: archivePath + "object/read",
+        deadlineClass: "archive",
         body: payload({
           type: type("read"),
           locator: job.archive.locator,
@@ -495,14 +591,20 @@ export class Archives implements C.ArchiveApi {
         integer(size, length, this.host.limits.maxArchiveBytes);
         rangeWithin(job.range, size);
       }
-      const expected = job.context.expectedInfo as C.ArchiveInfo | undefined;
-      if (expected && expected.byteLength !== size) {
+      const expected = job.expectedInfo;
+      if (!expected) fail("invalid-data", "Trusted archive metadata is required");
+      if (expected.byteLength !== size) {
         await response.body.cancel();
         fail("invalid-data", "Archive size differs from expected metadata");
       }
+      const streamSha256 = job.range ? job.expectedRangeSha256 : expected.sha256;
+      if (!streamSha256) {
+        await response.body.cancel();
+        fail("invalid-data", "Trusted archive range digest is required");
+      }
       const monitored = tracked(
         response.body,
-        { byteLength: length, sha256: !job.range ? expected?.sha256 : undefined },
+        { byteLength: length, sha256: streamSha256 },
         signal,
         (n) => progress(n, length),
       );
@@ -510,8 +612,9 @@ export class Archives implements C.ArchiveApi {
         await receiver.receive(monitored.stream, {
           operationId: id,
           archive: job.archive,
-          info: { byteLength: size, sha256: expected?.sha256 },
+          info: expected,
           range: job.range ?? { offset: 0, length },
+          streamSha256,
           signal,
         });
         monitored.assertComplete();
@@ -572,6 +675,7 @@ export class Archives implements C.ArchiveApi {
     );
     const response = await this.host.wire.request(endpoint, {
       path: archivePath + "object",
+      deadlineClass: "archive",
       method: "PUT",
       body: monitored.stream,
       signal,
@@ -689,6 +793,7 @@ export class Archives implements C.ArchiveApi {
       );
       const response = await this.host.wire.request(endpoint, {
         path: archivePath + "multipart/part",
+        deadlineClass: "archive",
         method: "PUT",
         body: monitored.stream,
         signal,
@@ -803,12 +908,12 @@ export class Archives implements C.ArchiveApi {
         path === "create" ? r.archive?.id : path === "list" ? r.authorityArchiveID : r.archiveID,
         256,
       ),
-      locator:
-        r.locator ??
-        gatewayLocator(
-          path === "create" ? r.archive.id : path === "list" ? r.authorityArchiveID : r.archiveID,
-          this.host.config.tor.onionService,
-        ),
+      // A peer locator is an unsigned routing hint. Incoming archive identity
+      // always uses this host's deterministic local locator.
+      locator: gatewayLocator(
+        path === "create" ? r.archive.id : path === "list" ? r.authorityArchiveID : r.archiveID,
+        this.host.config.tor.onionService,
+      ),
     });
     const store = adapters.store;
     const ok = (result: unknown, headers?: Record<string, string>) => ({
@@ -826,9 +931,9 @@ export class Archives implements C.ArchiveApi {
         signal,
       );
       if (path === "mutable/head") {
-        const head = await store.head(archive);
+        const head = await store.head(archive, { signal });
         if (!head) return ok({ result: "NOT_FOUND" });
-        const stat = await store.stat(archive);
+        const stat = await store.stat(archive, { signal });
         return ok({
           result: "SUCCESS",
           provider: "node-blob",
@@ -839,7 +944,7 @@ export class Archives implements C.ArchiveApi {
           size: stat?.info?.byteLength,
         });
       }
-      const stat = await store.stat(archive);
+      const stat = await store.stat(archive, { signal });
       if (!stat?.info) return { status: 404 };
       integer(stat.info.byteLength, 1, this.host.limits.maxArchiveBytes);
       let range: C.ByteRange | undefined;
@@ -892,16 +997,24 @@ export class Archives implements C.ArchiveApi {
           !isDeepStrictEqual(r.createIntent?.archive, r.archive))
       )
         fail("unauthorized", "Archive descriptor differs from the signed create intent");
-      await this.authorize(
+      const authorized = await this.authorize(
         `archive-${path}` as C.AuthorizedOperation,
         path,
         archive,
         body,
         r[`${path}Grant`],
         signal,
+        collection,
       );
+      const trustedCollection = authorized.collection!;
       if (path === "create") {
-        const result = await store.create(shaHex(canonical(body)), collection, document(r.archive));
+        const result = await store.create(
+          shaHex(canonical(body)),
+          trustedCollection,
+          document(r.archive),
+          this.host.fence(),
+          { signal },
+        );
         return ok({
           type: "unolock.federation.archive.create.response.v1",
           result: "SUCCESS",
@@ -909,10 +1022,15 @@ export class Archives implements C.ArchiveApi {
         });
       }
       if (path === "delete") {
-        await store.remove(shaHex(canonical(body)), archive);
+        await store.remove(shaHex(canonical(body)), archive, this.host.fence(), { signal });
         return ok({ type: "unolock.federation.archive.delete.response.v1", result: "SUCCESS" });
       }
-      const result = await store.list(collection, { limit: 64, cursor: r.cursor });
+      const cursor = r.cursor === undefined ? undefined : boundedText(r.cursor, maxCursorLength);
+      const result = await store.list(trustedCollection, { limit: 64, cursor }, { signal });
+      const nextCursor =
+        result.outcome === "listed" && result.page.cursor !== undefined
+          ? boundedText(result.page.cursor, maxCursorLength)
+          : undefined;
       return ok({
         type: "unolock.federation.archive.list.response.v2",
         ...(result.outcome === "deleted"
@@ -920,7 +1038,7 @@ export class Archives implements C.ArchiveApi {
           : {
               result: "SUCCESS",
               archives: result.page.items.map((item) => readDocument(item.metadata)),
-              nextCursor: result.page.cursor,
+              nextCursor,
             }),
       });
     }
@@ -951,17 +1069,24 @@ export class Archives implements C.ArchiveApi {
       if ((await handler.authorize(input, authority)) !== "allow")
         fail("unauthorized", "Archive access denied");
       signal.throwIfAborted();
-      const current = await store.head(archive);
+      const current = await store.head(archive, { signal });
       const pointer = parsePointer(r.pointer, archive.id);
-      if (current?.hash === version.hash)
+      const contentKey = `${archive.id}:${pointer.contentHash}`;
+      if (current?.hash === version.hash) {
+        await this.deleteArchiveContentMarker(contentKey);
         return ok({ result: "SUCCESS", pointerHash: version.hash });
-      const content = await this.host.state.get<C.ArchiveInfo>(
-        "archive-content",
-        `${archive.id}:${pointer.contentHash}`,
-      );
-      if (!content || `uobj:v1:sha256:${content.value.sha256}` !== pointer.contentCid)
-        fail("conflict", "Version content has not been verified and stored");
+      }
+      const content = await this.host.state.get<C.ArchiveInfo>("archive-content", contentKey);
       const previous = current ? parsePointer(readDocument(current.signed), archive.id) : null;
+      const reusesCurrentContent =
+        previous !== null &&
+        previous.contentHash === pointer.contentHash &&
+        previous.contentCid === pointer.contentCid;
+      if (
+        !reusesCurrentContent &&
+        (!content || `uobj:v1:sha256:${content.value.sha256}` !== pointer.contentCid)
+      )
+        fail("conflict", "Version content has not been verified and stored");
       if (
         pointer.sequence !== (previous?.sequence ?? 0) + 1 ||
         pointer.previousContentHash !== (previous?.contentHash ?? "")
@@ -972,7 +1097,10 @@ export class Archives implements C.ArchiveApi {
         archive,
         version.predecessor,
         version,
+        this.host.fence(),
+        { signal },
       );
+      if (result.outcome === "committed") await this.deleteArchiveContentMarker(contentKey);
       return ok(
         result.outcome === "committed"
           ? { result: "SUCCESS", pointerHash: result.version.hash }
@@ -1007,7 +1135,7 @@ export class Archives implements C.ArchiveApi {
         ? { previousPointerHash: r.previousPointerHash }
         : {}),
     };
-    const authority = await this.authorize(
+    const { authority } = await this.authorize(
       "archive-write",
       "write",
       archive,
@@ -1022,7 +1150,7 @@ export class Archives implements C.ArchiveApi {
     const stageId = shaHex(canonical({ archive, expected }));
     const adapters = this.host.config.archives!;
     return this.lock(stageId, async () => {
-      let stage = await adapters.store.inspectStage(stageId);
+      let stage = await adapters.store.inspectStage(stageId, { signal });
       if (stage.state === "committing")
         fail("unavailable", "Archive commit outcome is pending", true);
       if (stage.state !== "committed") {
@@ -1033,6 +1161,7 @@ export class Archives implements C.ArchiveApi {
           info,
           expectedRevision: r.currentEtag || null,
           range: { offset: 0, length: info.byteLength },
+          fence: this.host.fence(),
           signal,
         };
         const monitored = tracked(request.body, info, signal, () => {});
@@ -1048,7 +1177,7 @@ export class Archives implements C.ArchiveApi {
           signal,
         );
         if (sums.sha256 !== info.sha256 || sums.md5 !== r.md5) {
-          await adapters.store.discardStage(stageId);
+          await adapters.store.discardStage(stageId, this.host.fence(), { signal });
           fail("invalid-data", "Staged archive integrity mismatch");
         }
         signal.throwIfAborted();
@@ -1057,10 +1186,12 @@ export class Archives implements C.ArchiveApi {
           archive,
           info,
           r.currentEtag || null,
+          this.host.fence(),
+          { signal },
         );
         if (result.outcome === "conflict")
           return { status: 409, body: payload({ result: "CONFLICT" }) };
-        stage = await adapters.store.inspectStage(stageId);
+        stage = await adapters.store.inspectStage(stageId, { signal });
         if (stage.state !== "committed")
           fail("storage", "Archive store did not confirm commit", true);
       } else {
@@ -1069,10 +1200,21 @@ export class Archives implements C.ArchiveApi {
           fail("invalid-data", "Repeated archive write changed");
       }
       const mutable = readDocument(authority.bindings).mutable === true;
-      const contentKey = `${archive.id}:sha256:${r.contentSha256}`;
-      const content = await this.host.state.get("archive-content", contentKey);
-      if (!content && !(await this.host.state.put("archive-content", contentKey, null, info)))
-        fail("storage", "Verified archive content could not be recorded", true);
+      if (mutable) {
+        const contentKey = `${archive.id}:sha256:${r.contentSha256}`;
+        const content = await this.host.state.get("archive-content", contentKey);
+        if (
+          !content &&
+          !(await this.host.state.put(
+            "archive-content",
+            contentKey,
+            null,
+            info,
+            Date.now() + archiveContentMarkerLifetimeMs,
+          ))
+        )
+          fail("storage", "Verified archive content could not be recorded", true);
+      }
       const etag = mutable ? boundedText(r.newEtag) : stage.revision;
       return {
         status: 200,
@@ -1135,10 +1277,10 @@ export class Archives implements C.ArchiveApi {
     if (operation === "init") {
       integer(r.contentLength, 1, this.host.limits.maxArchiveBytes);
       md5Value(r.md5);
-      const id = shaHex(canonical({ archive, proof: r.writeGrant }));
+      const id = shaHex(canonical({ request: proofRequest, proof: r.writeGrant }));
       const current = await state.get<MultipartSession>("archive-incoming", id);
       if (!current) {
-        const stat = await adapters.store.stat(archive);
+        const stat = await adapters.store.stat(archive, { signal });
         if (stat?.revision) fail("conflict", "Multipart uploads require an uncommitted archive");
         let count = 0;
         for await (const _ of state.scan("archive-incoming"))
@@ -1168,15 +1310,11 @@ export class Archives implements C.ArchiveApi {
     boundedText(r.uploadId);
     return this.lock(r.uploadId, async () => {
       const stored = await state.get<MultipartSession>("archive-incoming", r.uploadId);
-      if (
-        !stored ||
-        stored.value.archive.id !== archive.id ||
-        stored.value.archive.locator !== archive.locator
-      )
+      if (!stored || stored.value.archive.id !== archive.id)
         fail("unauthorized", "Upload session is unavailable");
       const session = stored.value;
       if (operation === "abort") {
-        const result = await adapters.store.discardStage(r.uploadId);
+        const result = await adapters.store.discardStage(r.uploadId, this.host.fence(), { signal });
         if (result === "pending") fail("unavailable", "Archive commit outcome is pending", true);
         if (result === "discarded")
           await state.put(
@@ -1214,6 +1352,7 @@ export class Archives implements C.ArchiveApi {
             info: session.info,
             expectedRevision: null,
             range: { offset, length: r.contentLength },
+            fence: this.host.fence(),
             signal,
           });
           monitored.assertComplete();
@@ -1255,7 +1394,7 @@ export class Archives implements C.ArchiveApi {
         byteLength: session.info.byteLength,
         sha256: Buffer.from(r.relayManifest.contentSha256, "hex").toString("base64url"),
       };
-      const stage = await adapters.store.inspectStage(r.uploadId);
+      const stage = await adapters.store.inspectStage(r.uploadId, { signal });
       if (stage.state === "committing")
         fail("unavailable", "Archive commit outcome is pending", true);
       if (stage.state !== "committed") {
@@ -1267,7 +1406,14 @@ export class Archives implements C.ArchiveApi {
         if (sums.sha256 !== info.sha256 || sums.md5 !== session.md5)
           fail("invalid-data", "Upload completion integrity mismatch");
         signal.throwIfAborted();
-        const result = await adapters.store.commitStage(r.uploadId, archive, info, null);
+        const result = await adapters.store.commitStage(
+          r.uploadId,
+          archive,
+          info,
+          null,
+          this.host.fence(),
+          { signal },
+        );
         if (result.outcome === "conflict")
           return { status: 200, body: payload({ result: "ETAG_MISMATCH" }) };
       } else if (stage.info.sha256 !== info.sha256 || stage.info.byteLength !== info.byteLength)
@@ -1291,6 +1437,10 @@ export class Archives implements C.ArchiveApi {
       this.locks.delete(key);
     }
   }
+  private async deleteArchiveContentMarker(key: string): Promise<void> {
+    const marker = await this.host.state.get("archive-content", key);
+    if (marker) await this.host.state.put("archive-content", key, marker.revision, null);
+  }
   async maintain(signal: AbortSignal) {
     let count = 0;
     for await (const stored of this.host.state.scan<MultipartSession>(
@@ -1300,10 +1450,19 @@ export class Archives implements C.ArchiveApi {
       if (++count > 16 || signal.aborted) return;
       if (this.locks.has(stored.key)) continue;
       await this.lock(stored.key, async () => {
-        const discarded = await this.host.config.archives?.store.discardStage(stored.key);
+        const discarded = await this.host.config.archives?.store.discardStage(
+          stored.key,
+          this.host.fence(),
+          { signal },
+        );
         if (discarded === "pending") return;
         await this.host.state.put("archive-incoming", stored.key, stored.revision, null);
       });
+    }
+    count = 0;
+    for await (const stored of this.host.state.scan("archive-content", Date.now())) {
+      if (++count > 16 || signal.aborted) return;
+      await this.host.state.put("archive-content", stored.key, stored.revision, null);
     }
   }
 }

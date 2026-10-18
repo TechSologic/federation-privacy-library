@@ -7,7 +7,7 @@ this document.
 ## Before First Use
 
 An authorized TechSologic maintainer must complete review of the
-[agreement](../../CONTRIBUTOR_LICENSE_AGREEMENT.md), resolve its draft status,
+[agreement](../../../CONTRIBUTOR_LICENSE_AGREEMENT.md), resolve its draft status,
 preserve the reviewed revision, and choose a durable location for acceptance
 records. That location must be accessible to the maintainers who verify merges
 and transferable through the documented succession process.

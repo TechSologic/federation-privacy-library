@@ -4,17 +4,30 @@ import { createHash } from "node:crypto";
 import { TestNetwork, memorySource } from "../../src/testing/index.js";
 import type { ArchiveInfo, ArchiveSource } from "../../src/index.js";
 import { collect } from "../../src/streams.js";
-import { document, gatewayLocator, readDocument } from "../../src/protocol/archives.js";
-import { address, config, endpoint } from "../helpers.js";
+import {
+  archivePath,
+  canonical,
+  document,
+  gatewayLocator,
+  readDocument,
+  shaHex,
+} from "../../src/protocol/archives.js";
+import { HttpWire } from "../../src/transport.js";
+import { address, config, endpoint, eventually } from "../helpers.js";
 import { archivePolicy, TestArchives } from "../archive-adapter.js";
 
-async function pair(t: any) {
+async function pair(t: any, mutable = false) {
   const network = new TestNetwork();
-  const policy = archivePolicy();
+  const policy = archivePolicy(mutable);
   const store = new TestArchives();
-  const a = network.create({ ...config("i", ["j"]), proofs: policy.proofs });
-  const b = network.create({
-    ...config("j", ["i"]),
+  const a = network.createRuntime({
+    ...config("i", ["j"]),
+    proofs: policy.proofs,
+    authorization: policy.authorization,
+  });
+  const receiverConfig = config("j", ["i"]);
+  const b = network.createRuntime({
+    ...receiverConfig,
     authorization: policy.authorization,
     archives: { receiver: store, store },
   });
@@ -24,7 +37,7 @@ async function pair(t: any) {
   await Promise.all([a.start(), b.start()]);
   const target = await address();
   await b.addresses.register(target.record);
-  return { a, b, target, store, policy, network };
+  return { a, b, target, store, policy, network, receiverStorage: receiverConfig.storage };
 }
 function source(data: Uint8Array, id = "syntheticarchive1"): ArchiveSource {
   const memory = memorySource(data);
@@ -47,9 +60,12 @@ test(
     const { a, target, store } = await pair(t);
     const data = new Uint8Array(300_001).map((_, i) => i % 251);
     const input = source(data);
+    const info = await input.describe();
     const events: string[] = [];
     const send = await a.archives.send(target.address, input, {
-      onEvent: (event) => events.push(event.type),
+      onEvent: (event) => {
+        events.push(event.type);
+      },
     });
     const result = await send.wait({ signal: AbortSignal.timeout(8000) });
     assert.equal(result.status, "completed", JSON.stringify(result));
@@ -68,10 +84,30 @@ test(
         },
       },
       undefined,
-      { range: { offset: 257, length: 1234 } },
+      {
+        range: { offset: 257, length: 1234 },
+        expectedInfo: info,
+        expectedRangeSha256: createHash("sha256").update(data.slice(257, 1491)).digest("base64url"),
+      },
     );
     assert.equal((await read.wait({ signal: AbortSignal.timeout(8000) })).status, "completed");
     assert.deepEqual(received, Buffer.from(data.slice(257, 1491)));
+    const badRange = await a.archives.read(
+      target.address,
+      input.archive,
+      {
+        async receive(stream) {
+          await collect(stream, 1234);
+        },
+      },
+      undefined,
+      {
+        range: { offset: 257, length: 1234 },
+        expectedInfo: info,
+        expectedRangeSha256: createHash("sha256").update("incorrect-range").digest("base64url"),
+      },
+    );
+    assert.equal((await badRange.wait({ signal: AbortSignal.timeout(8000) })).status, "failed");
     const bad = await a.archives.read(
       target.address,
       input.archive,
@@ -82,9 +118,10 @@ test(
       },
       undefined,
       {
-        context: document({
-          expectedInfo: { byteLength: data.length, sha256: "incorrect-digest" },
-        }),
+        expectedInfo: {
+          byteLength: data.length,
+          sha256: createHash("sha256").update("incorrect").digest("base64url"),
+        },
       },
     );
     assert.equal((await bad.wait({ signal: AbortSignal.timeout(8000) })).status, "failed");
@@ -126,11 +163,97 @@ test("wrong authority fails closed before archive receiver runs", { timeout: 150
   assert.equal(store.stages.size, 0);
   assert.equal(store.commits, 0);
 });
+test("archive attempts have an absolute lifetime even while an adapter is active", async (t) => {
+  const network = new TestNetwork();
+  const policy = archivePolicy();
+  const store = new TestArchives();
+  let aborted = false;
+  store.afterReceive = async (metadata) => {
+    await new Promise<void>((resolve) => {
+      if (metadata.signal.aborted) resolve();
+      else metadata.signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+    aborted = metadata.signal.aborted;
+    metadata.signal.throwIfAborted();
+  };
+  const a = network.createRuntime(
+    {
+      ...config("u", ["v"]),
+      proofs: policy.proofs,
+      authorization: policy.authorization,
+      limits: { maxAttempts: 1 },
+    },
+    { requestDeadlineMs: 150 },
+  );
+  const b = network.createRuntime(
+    {
+      ...config("v", ["u"]),
+      authorization: policy.authorization,
+      archives: { receiver: store, store },
+    },
+    { requestDeadlineMs: 150 },
+  );
+  t.after(async () => Promise.all([a.stop(), b.stop()]));
+  await Promise.all([a.start(), b.start()]);
+  const target = await address();
+  await b.addresses.register(target.record);
+  const transfer = await a.archives.send(target.address, source(new Uint8Array([8, 9, 10])));
+  assert.equal((await transfer.wait({ signal: AbortSignal.timeout(3000) })).status, "failed");
+  await eventually(() => aborted);
+});
+test("multipart session identity ignores unsigned peer locator variants", async (t) => {
+  const network = new TestNetwork();
+  const policy = archivePolicy();
+  const store = new TestArchives();
+  const cfg = {
+    ...config("w"),
+    authorization: policy.authorization,
+    archives: { receiver: store, store },
+  };
+  const runtime = network.createRuntime(cfg);
+  t.after(() => runtime.stop());
+  await runtime.start();
+  const archiveID = "synthetic-multipart-locator";
+  const proofRequest = {
+    archiveID,
+    md5: createHash("md5")
+      .update(new Uint8Array([1]))
+      .digest("base64"),
+    contentLength: 1,
+  };
+  const canonicalRequest = canonical(proofRequest);
+  const [proof] = await policy.proofs.provide({
+    operation: "multipart-init",
+    target: { archive: { id: archiveID, locator: "opaque-client-locator" } },
+    canonicalRequest,
+    requestHash: shaHex(canonicalRequest),
+    signal: AbortSignal.timeout(1000),
+  });
+  const wire = new HttpWire(network.connector(), cfg.tor);
+  const init = async (locator: string) =>
+    wire.json(
+      cfg.tor.onionService,
+      archivePath + "multipart/init",
+      {
+        type: "unolock.federation.archive.multipart.init.request.v1",
+        locator,
+        ...proofRequest,
+        writeGrant: readDocument(proof),
+      },
+      AbortSignal.timeout(2000),
+    ) as Promise<{ uploadId: string }>;
+  const first = await init("opaque-locator-a");
+  const second = await init("opaque-locator-b");
+  assert.equal(second.uploadId, first.uploadId);
+  const sessions = await cfg.storage.state.list({ collection: "archive-incoming", limit: 10 });
+  assert.equal(sessions.items.length, 1);
+  await wire.stop();
+});
 test(
   "signed version commits preserve predecessor and scope bindings",
   { timeout: 15000 },
   async (t) => {
-    const { a, target, policy } = await pair(t);
+    const { a, target, policy, store, receiverStorage } = await pair(t, true);
     const input = source(new Uint8Array([1]));
     const archive = input.archive;
     const info: ArchiveInfo = {
@@ -146,20 +269,41 @@ test(
         signedSuccessor: signed,
       }),
     );
+    const upload = await (
+      await a.archives.send(target.address, input, undefined, {
+        context: document({
+          newEtag: '"synthetic-mutable-etag"',
+          previousPointerHash: "",
+        }),
+      })
+    ).wait({ signal: AbortSignal.timeout(8000) });
+    assert.equal(upload.status, "completed", JSON.stringify(upload));
     assert.equal(
       (
-        await (
-          await a.archives.send(target.address, input)
-        ).wait({ signal: AbortSignal.timeout(8000) })
-      ).status,
-      "completed",
+        await receiverStorage.state.list({
+          collection: "archive-content",
+          limit: 10,
+        })
+      ).items.length,
+      1,
     );
     const commit = await a.archives.commitVersion(target.address, archive, {
       expectedPredecessor: null,
       signedSuccessor: signed,
     });
     assert.equal(commit.outcome, "committed");
-    const head = await a.archives.head(target.address, archive);
+    assert.equal(
+      (
+        await receiverStorage.state.list({
+          collection: "archive-content",
+          limit: 10,
+        })
+      ).items.length,
+      0,
+    );
+    const head = await a.archives.head(target.address, archive, {
+      freshness: { minimumSequence: 0 },
+    });
     assert.equal(head?.hash, readDocument(signed).pointerHash);
     const successor = policy.pointer(archive.id, info, readDocument(signed));
     const updated = await a.archives.commitVersion(target.address, archive, {
@@ -167,6 +311,33 @@ test(
       signedSuccessor: successor,
     });
     assert.equal(updated.outcome, "committed");
+    if (updated.outcome === "committed") {
+      const forged = {
+        ...readDocument(updated.version.signed),
+        signature: Buffer.alloc(64, 7).toString("base64url"),
+      };
+      store.versions.set(archive.id, { ...updated.version, signed: document(forged) });
+      await assert.rejects(
+        a.archives.head(target.address, archive, {
+          freshness: {
+            minimumSequence: updated.version.sequence,
+            hashAtMinimum: updated.version.hash,
+          },
+        }),
+        /signature/i,
+      );
+      store.versions.set(archive.id, commit.version);
+      await assert.rejects(
+        a.archives.head(target.address, archive, {
+          freshness: {
+            minimumSequence: updated.version.sequence,
+            hashAtMinimum: updated.version.hash,
+          },
+        }),
+        /older than trusted local state/i,
+      );
+      store.versions.set(archive.id, updated.version);
+    }
     const tampered = { ...readDocument(successor), writerAccessId: "different-writer" };
     await assert.rejects(
       a.archives.commitVersion(target.address, archive, {
@@ -194,8 +365,8 @@ test(
         },
       },
     };
-    let a = network.create(sender);
-    const b = network.create({
+    let a = network.createRuntime(sender);
+    const b = network.createRuntime({
       ...config("j", ["i"]),
       authorization: policy.authorization,
       archives: { receiver: store, store },
@@ -224,7 +395,7 @@ test(
     await staged;
     await a.stop();
     store.afterReceive = undefined;
-    a = network.create(sender);
+    a = network.createRuntime(sender);
     await a.start();
     const resumed = await a.transfers.get(transfer.id);
     assert.ok(resumed);
@@ -262,7 +433,7 @@ test(
   "archive creation, listing and deletion use signed control documents",
   { timeout: 10000 },
   async (t) => {
-    const { a, target } = await pair(t);
+    const { a, target, policy, network, store } = await pair(t);
     const collection = {
       id: "synthetic-collection",
       authorityArchiveId: "synthetic-authority-archive",
@@ -288,6 +459,26 @@ test(
     assert.equal(listing.outcome, "listed");
     if (listing.outcome === "listed")
       assert.equal(listing.page.items[0].archive.id, created.archive.id);
+    const cursor = store.cursorFor(collection);
+    await a.archives.list(target.address, collection, {
+      limit: 64,
+      cursor,
+    });
+    await assert.rejects(
+      store.list(
+        { ...collection, id: "different-collection" },
+        { limit: 64, cursor },
+        { signal: AbortSignal.timeout(1000) },
+      ),
+      /cursor scope/i,
+    );
+    await assert.rejects(
+      a.archives.list(target.address, collection, {
+        limit: 64,
+        cursor: "x".repeat(4097),
+      }),
+      /identifier/i,
+    );
     await a.archives.remove(target.address, created.archive, {
       context: document({
         archiveListID: collection.id,
@@ -297,5 +488,64 @@ test(
     const after = await a.archives.list(target.address, collection, { limit: 64 });
     assert.equal(after.outcome, "listed");
     if (after.outcome === "listed") assert.equal(after.page.items.length, 0);
+    const legacyListRequest = { authorityArchiveID: collection.authorityArchiveId };
+    const canonicalListRequest = canonical(legacyListRequest);
+    const [listGrant] = await policy.proofs.provide({
+      operation: "archive-list",
+      target: {
+        archive: { id: collection.authorityArchiveId, locator: collection.locator },
+        collection,
+      },
+      canonicalRequest: canonicalListRequest,
+      requestHash: shaHex(canonicalListRequest),
+      signal: AbortSignal.timeout(1000),
+    });
+    const wire = new HttpWire(network.connector(), config("y").tor);
+    const tamperedCollection = await wire.request(endpoint("j"), {
+      path: archivePath + "list",
+      signal: AbortSignal.timeout(2000),
+      body: Buffer.from(
+        JSON.stringify({
+          type: "unolock.federation.archive.list.request.v2",
+          archiveListID: "attacker-selected-collection",
+          authorityArchiveID: collection.authorityArchiveId,
+          listGrant: readDocument(listGrant),
+        }),
+      ),
+      headers: { "content-type": "application/json" },
+    });
+    await collect(tamperedCollection.body, 8192);
+    assert.equal(tamperedCollection.status, 403);
+    await wire.stop();
+    assert.ok(
+      policy.proofRequests.some(
+        ({ operation, request }) =>
+          operation === "archive-create" &&
+          request.archiveListID === undefined &&
+          request.authorityArchiveID === collection.authorityArchiveId,
+      ),
+    );
+    assert.ok(
+      policy.proofRequests.some(
+        ({ operation, request }) =>
+          operation === "archive-list" &&
+          request.archiveListID === undefined &&
+          request.cursor === undefined,
+      ),
+    );
+    assert.ok(
+      policy.proofRequests.some(
+        ({ operation, request }) =>
+          operation === "archive-delete" && request.archiveListID === undefined,
+      ),
+    );
+    assert.ok(
+      policy.authorizationRequests.some(
+        ({ operation, target }) =>
+          operation === "archive-list" &&
+          target.collection?.id === collection.id &&
+          target.collection.authorityArchiveId === collection.authorityArchiveId,
+      ),
+    );
   },
 );

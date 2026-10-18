@@ -1,9 +1,13 @@
-import { createHash, randomBytes } from "node:crypto";
-import { hashAddress, onion } from "../address.js";
+import { onion } from "../address.js";
 import { fail, integer } from "../errors.js";
 import { messagePath, legacyMessagePath } from "./messages.js";
+import { openAddressRouteAuthorization, type AddressRouteAuthorization } from "./addressRoutes.js";
+import { validateSealedReceiveLookupValue } from "./lookupRecords.js";
 
 export const gridPath = "/.well-known/unolock-grid/v1/";
+// A 16 KiB sealed value expands to ~22 KiB inside its base64url JSON envelope.
+export const lookupRequestMaxBytes = (path: string): number =>
+  path === gridPath + "put-value" ? 32 * 1024 : 8192;
 export const keyPath = "/.well-known/unolock-federation/v1/receive-address/public-key";
 export const replicaLeaseMs = 24 * 60 * 60_000;
 export interface LookupTarget {
@@ -11,14 +15,7 @@ export interface LookupTarget {
   deliveryPath: string;
   priority: number;
 }
-export interface LookupRecord {
-  type: "unolock.receive.lookup.v1";
-  recordKey: string;
-  targets: LookupTarget[];
-  createdAt: number;
-  recordNonce: string;
-  recordCommitment: string;
-}
+export type LookupRecord = AddressRouteAuthorization;
 export function object(
   input: unknown,
   required: readonly string[],
@@ -53,57 +50,16 @@ export function base64(value: unknown, maxBytes: number): Uint8Array {
     fail("invalid-data", "Invalid encoded bytes");
   return bytes;
 }
-export function newLookup(addressHash: string, endpoint: string): string {
-  hashAddress(addressHash);
-  onion(endpoint);
-  const targets = [{ onionService: endpoint, deliveryPath: messagePath, priority: 0 }];
-  const recordNonce = randomBytes(32).toString("base64url");
-  const recordCommitment = createHash("sha256")
-    .update(`${addressHash}\0${recordNonce}\0${JSON.stringify(targets)}`)
-    .digest("base64url");
-  return Buffer.from(
-    JSON.stringify({
-      type: "unolock.receive.lookup.v1",
-      recordKey: addressHash,
-      targets,
-      createdAt: Date.now(),
-      recordNonce,
-      recordCommitment,
-    }),
-  ).toString("base64url");
+export function validateLookupEnvelope(encoded: string, addressHash: string): void {
+  validateSealedReceiveLookupValue(json(base64(encoded, 16 * 1024)), addressHash);
 }
-export function decodeLookup(encoded: string, addressHash: string): LookupRecord {
-  const parsed = json(base64(encoded, 4096));
-  const v = object(
-    parsed,
-    ["type", "recordKey", "createdAt", "recordNonce", "recordCommitment"],
-    ["targets", "primary"],
-  );
-  if (
-    v.type !== "unolock.receive.lookup.v1" ||
-    v.recordKey !== addressHash ||
-    "targets" in v === "primary" in v
-  )
-    fail("invalid-data", "Invalid lookup record");
-  integer(v.createdAt, 1);
-  base64(v.recordNonce, 4096);
-  base64(v.recordCommitment, 4096);
-  const targets = v.targets ?? [v.primary];
-  if (!Array.isArray(targets) || targets.length < 1 || targets.length > 8)
-    fail("invalid-data", "Invalid lookup targets");
-  const normalized: LookupTarget[] = targets.map((target) => {
-    const t = object(target, ["onionService", "deliveryPath", "priority"]);
-    onion(t.onionService);
-    integer(t.priority, 0, 3);
-    if (![messagePath, legacyMessagePath].includes(t.deliveryPath))
-      fail("invalid-data", "Invalid delivery path");
-    return { onionService: t.onionService, deliveryPath: t.deliveryPath, priority: t.priority };
+export function decodeLookup(
+  encoded: string,
+  addressHash: string,
+  validationFingerprint: string,
+): LookupRecord {
+  return openAddressRouteAuthorization(json(base64(encoded, 16 * 1024)), {
+    addressHash,
+    validationFingerprint,
   });
-  // This commitment is protocol metadata, not a signature granting route authority.
-  return {
-    ...v,
-    targets: normalized.sort(
-      (a, b) => a.priority - b.priority || a.onionService.localeCompare(b.onionService),
-    ),
-  } as LookupRecord;
 }

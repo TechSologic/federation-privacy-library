@@ -1,38 +1,18 @@
 # Documentation
 
-Federation Privacy Library has an experimental runtime and tests. The original
-design documents remain proposals; the API is not stable or published.
+Start with the [architecture overview](using-library/architecture.md) for the
+components, public interfaces, integration choices and operation flows.
+Then choose the stream that matches your work:
 
-## Design And Development
+| Audience                                   | Start here                                             | Covers                                                                         |
+| ------------------------------------------ | ------------------------------------------------------ | ------------------------------------------------------------------------------ |
+| Building an application with the library   | [Using the library](using-library/README.md)           | Public API, providers, Tor integration, lifecycle and privacy responsibilities |
+| Changing or maintaining the library itself | [Developing the library](https://github.com/TechSologic/federation-privacy-library/blob/main/docs/developing-library/README.md) | Development, architecture, security, testing, contribution and releases        |
 
-- [Project overview](../README.md)
-- [Runtime behavior, evidence, and remaining gaps](runtime.md)
-- [Implemented public contracts](../src/contracts.ts)
-- [Runnable two-node example](../examples/two-nodes.mjs)
-- [Library contract baseline](design/library-contract.md)
-- [Proposed public interfaces and semantics](design/proposed-api.md)
-- [TypeScript design declarations](design/proposed-api.d.ts)
-- [Sender and receiver design examples](design/api-examples.ts)
-- [Comparison with node and managed implementations](design/implementation-map.md)
-- [Developer guide](../DEVELOPING.md)
-- [Contributing](../CONTRIBUTING.md)
-- [Changelog](../CHANGELOG.md)
+The API is experimental. These guides describe the implemented library and its
+provider contracts; use the declarations shipped with your installed artifact.
 
-## Security And Project Policies
-
-- [Security invariants](security/invariants.md)
-- [Private security reporting](../SECURITY.md)
-- [License and contributor rights](legal/README.md)
-- [Contributor License Agreement](../CONTRIBUTOR_LICENSE_AGREEMENT.md)
-- [CLA acceptance records](legal/cla-records.md)
-- [Governance](../GOVERNANCE.md)
-- [Maintainer responsibilities](../MAINTAINERS.md)
-- [Branding and official releases](../TRADEMARKS.md)
-- [Code of conduct](../CODE_OF_CONDUCT.md)
-- [Support and project contact](../SUPPORT.md)
-- [Repository setup checklist](maintainers/repository-setup.md)
-- [npm release workflow and activation](maintainers/releases.md)
-
-The design declarations and sketches are review artifacts. Runtime tests are
-independent of sibling repositories and private infrastructure. Optional reference
-checks do not yet establish complete legacy server or storage-adapter parity.
+Keep application contracts and integration guidance in `using-library/`.
+Keep implementation design and maintenance procedures in `developing-library/`.
+Link to shared contracts instead of duplicating them. Keep behavior, examples
+and limitations consistent with the public declarations.

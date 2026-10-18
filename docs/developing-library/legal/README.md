@@ -1,8 +1,8 @@
 # License And Contributor Rights
 
-Federation Privacy Library uses [GNU AGPL version 3](../../LICENSE)
-(`AGPL-3.0-only`). The existing root license text is preserved verbatim.
-Future package metadata and covered distributions must identify the same license
+Federation Privacy Library uses [GNU AGPL version 3](../../../LICENSE)
+(`AGPL-3.0-only`).
+Package metadata and covered distributions must identify the same license
 unless an authorized licensing decision explicitly changes them.
 
 The software license governs use, modification, and redistribution of covered
@@ -23,21 +23,20 @@ their contributions. Repository ownership is not an assignment of every
 contributor's copyright.
 
 Official release authority and succession are described in
-[Governance](../../GOVERNANCE.md). Branding and provenance are addressed
-separately in [TRADEMARKS.md](../../TRADEMARKS.md). Existing AGPL rights do not
+[Governance](../../../GOVERNANCE.md). Branding and provenance are addressed
+separately in [TRADEMARKS.md](../../../TRADEMARKS.md). Existing AGPL rights do not
 depend on continued company operation.
 
 ## Contributor License Agreement
 
-The [CLA](../../CONTRIBUTOR_LICENSE_AGREEMENT.md) follows the contribution model
-used for TechSologic's UnoLock Federated Node. Contributors retain copyright
-and grant TechSologic permanent, irrevocable, worldwide, royalty-free,
+Under the [CLA](../../../CONTRIBUTOR_LICENSE_AGREEMENT.md), contributors retain
+copyright and grant TechSologic permanent, irrevocable, worldwide, royalty-free,
 non-exclusive rights to use, modify, distribute, and sublicense their original
 contributions. Its express scope is Federation Privacy Library.
 
 The terms remain a draft for legal review before first use. A maintainer must
 provide the reviewed revision for explicit acceptance; filing a PR alone is
-not acceptance. See [CONTRIBUTING.md](../../CONTRIBUTING.md) and the
+not acceptance. See [CONTRIBUTING.md](../../../CONTRIBUTING.md) and the
 [recording procedure](cla-records.md).
 
 Preserve accepted agreement revisions. Do not infer this project's acceptance

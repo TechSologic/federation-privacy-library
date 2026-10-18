@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer as tcpServer, connect } from "node:net";
 import { createServer as httpServer } from "node:http";
-import { HttpWire, torConnector } from "../../src/transport.js";
+import { setTimeout as delay } from "node:timers/promises";
+import { HttpWire, localConnect, torConnector } from "../../src/transport.js";
 import { config, endpoint } from "../helpers.js";
 import { collect } from "../../src/streams.js";
 test(
@@ -77,3 +78,71 @@ test(
     );
   },
 );
+
+test("a timed-out non-cooperative handler remains admission-counted", async (t) => {
+  const settings = config("x").tor;
+  let port = 0;
+  const server = new HttpWire(
+    {
+      connect: (_endpoint, signal) => localConnect("127.0.0.1", port, signal),
+    },
+    settings,
+    100,
+  );
+  port = await server.start(async () => new Promise<never>(() => {}));
+  const client = new HttpWire(server.connector, settings, 1000);
+  t.after(async () => Promise.all([client.stop(), server.stop()]));
+  const responses = await Promise.all(
+    Array.from({ length: 16 }, (_, index) =>
+      client.request(settings.onionService, {
+        path: `/synthetic-hang-${index}`,
+        signal: AbortSignal.timeout(2000),
+      }),
+    ),
+  );
+  for (const response of responses) {
+    assert.equal(response.status, 503);
+    assert.equal(
+      JSON.parse(Buffer.from(await collect(response.body, 100)).toString()).type,
+      "SERVER",
+    );
+  }
+  const throttled = await client.request(settings.onionService, {
+    path: "/synthetic-after-timeout",
+    signal: AbortSignal.timeout(2000),
+  });
+  assert.equal(throttled.status, 503);
+  assert.equal(
+    JSON.parse(Buffer.from(await collect(throttled.body, 100)).toString()).type,
+    "THROTTLED",
+  );
+});
+
+test("archive byte routes use the separate finite streaming deadline", async (t) => {
+  const settings = config("w").tor;
+  let port = 0;
+  const connector = {
+    connect: (_endpoint: string, signal: AbortSignal) => localConnect("127.0.0.1", port, signal),
+  };
+  const server = new HttpWire(connector, settings, { controlMs: 100, archiveMs: 500 });
+  port = await server.start(async () => {
+    await delay(150);
+    return { status: 200, body: new Uint8Array([1]) };
+  });
+  const client = new HttpWire(connector, settings, { controlMs: 1000, archiveMs: 1000 });
+  t.after(async () => Promise.all([client.stop(), server.stop()]));
+
+  const control = await client.request(settings.onionService, {
+    path: "/synthetic-control",
+    signal: AbortSignal.timeout(2000),
+  });
+  assert.equal(control.status, 503);
+  await collect(control.body, 100);
+
+  const archive = await client.request(settings.onionService, {
+    path: "/federation/v1/archive/object/read",
+    signal: AbortSignal.timeout(2000),
+  });
+  assert.equal(archive.status, 200);
+  assert.deepEqual([...(await collect(archive.body, 100))], [1]);
+});

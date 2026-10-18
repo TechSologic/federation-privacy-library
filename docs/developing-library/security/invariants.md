@@ -1,7 +1,6 @@
 # Security Invariants
 
-These are implementation requirements and review boundaries for the planned
-library. Their presence in documentation is not evidence that code, tests, or
+These are implementation requirements and review boundaries for the library. Their presence in documentation is not evidence that code, tests, or
 independent security review already establish them.
 
 ## Content And Application Authority
@@ -37,6 +36,12 @@ independent security review already establish them.
     isolation, concurrency, or integrity checks.
 12. Untrusted routing, provider locators, and peer-supplied keys cannot install
     new authority or override pinned expectations.
+    Receive Addresses remain fixed to their original node's onion service for
+    security. Moving to another service requires a new address; a DHT update,
+    failed delivery or expired replica cannot authorize moving an existing one.
+    Persist the first verified route before use and retain verified bindings
+    across restarts without automatic expiry or eviction. Keep unverified
+    replicas separate. At capacity or on storage failure, fail closed.
 13. Preserve client-signed bytes and semantics. A library or server must not
     manufacture replacement client authority to make an operation succeed.
 
@@ -55,35 +60,44 @@ independent security review already establish them.
 18. Persist durable intent before relying on transient queue notifications.
     Conditional completion must reject stale, replaced, or cancelled work.
 19. Adapter guarantees must be explicit. Storage failures and conflicts must
-    not be silently treated as successful writes or definitive absence.
+    not be silently treated as successful writes or definitive absence. Every
+    mutation must be rejected after its monotonically increasing runtime fence
+    expires or is superseded.
+20. Production adapters encrypt all federation records, blobs, identifying
+    indexes, journals, temporary files, replicas and backups at rest. Storage
+    keys remain separate from stored data, are separated by purpose and can be
+    rotated. Content encryption does not satisfy metadata encryption.
 
 ## Archives And Streams
 
-20. Keep memory, input sizes, concurrency, stored state, retries, and retention
+21. Keep memory, input sizes, concurrency, stored state, retries, and retention
     bounded. Backpressure must propagate across stream and transport boundaries.
-21. Verify encrypted length, digest, ranges, and applicable signed metadata.
+    Timed-out adapter work remains admission-counted until it actually settles.
+22. Verify encrypted length, digest, ranges, and applicable signed metadata.
     Do not expose partial or unverified data as a committed archive.
-22. Mutable versions use verified client-signed state and conditional predecessor
-    checks. Conflicts must not silently overwrite an accepted version.
-23. Staging, commit, discard, cleanup, and recovery must be idempotent where
+23. Mutable versions use verified client-signed state and conditional predecessor
+    checks. Head reads reject state older than the caller's trusted sequence/hash
+    checkpoint. Conflicts must not silently overwrite an accepted version.
+24. Staging, commit, discard, cleanup, and recovery must be idempotent where
     retries are allowed. Preserve recoverable state when commit outcome is unknown.
-24. Closing, cancellation, or source failure must release resources according
+25. Closing, cancellation, or source failure must release resources according
     to the documented lifecycle without corrupting accepted durable state.
+    Adapters must not perform a late durable mutation after their signal aborts.
 
 ## Privacy And Evidence
 
-25. Logs and public fixtures exclude plaintext, private keys, credentials, raw
+26. Logs and public fixtures exclude plaintext, private keys, credentials, raw
     addresses, raw onion routes, access proofs, signed URLs, and identifying
     runtime captures. Prefer bounded aggregate diagnostics.
-26. Provider and replication mechanics remain inside adapters. Do not add
+27. Provider and replication mechanics remain inside adapters. Do not add
     persistent relationship metadata to work around an unrelated infrastructure
     problem.
-27. Default builds and tests must be independent of private services, production
+28. Default builds and tests must be independent of private services, production
     data, and private credentials.
-28. Security and compatibility claims require appropriate source and execution
+29. Security and compatibility claims require appropriate source and execution
     evidence. Source review, unit tests, interoperability tests, published
     artifacts, and deployed behavior are distinct evidence.
 
 A proposed change to these requirements needs an explicit design and security
 review recorded with its compatibility and verification consequences.
-Report suspected violations privately through [SECURITY.md](../../SECURITY.md).
+Report suspected violations privately through [SECURITY.md](../../../SECURITY.md).

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { deriveAddress, generateAddress, validateAddress } from "../../src/index.js";
+import { verifyAddressKeys } from "../../src/address.js";
 import { decodeMessage, encodeMessage, isAcceptance } from "../../src/protocol/messages.js";
 import { byteSource, collect, tracked } from "../../src/streams.js";
 import { message } from "../helpers.js";
@@ -46,6 +47,26 @@ test("address derivation hashes the secret with the established domain separator
   assert.equal(first.identity.encryptionFingerprint, second.identity.encryptionFingerprint);
   await assert.rejects(deriveAddress("invalid"));
 });
+test("address verification returns only the validation key committed by the address", async () => {
+  const committed = "recipient-validation-key";
+  const generated = await generateAddress({
+    publicKey: "recipient-encryption-key",
+    validationKey: committed,
+  });
+  assert.deepEqual(
+    verifyAddressKeys(generated.identity, {
+      publicKey: "recipient-encryption-key",
+      validationKeys: [
+        { id: 1, validationKey: committed },
+        { id: 2, validationKey: "attacker-added-validation-key" },
+      ],
+    }),
+    {
+      publicKey: "recipient-encryption-key",
+      validationKeys: [{ id: 1, validationKey: committed }],
+    },
+  );
+});
 test("streams enforce length, digest, ranges and early receiver completion", async () => {
   const source = byteSource(new Uint8Array([1, 2, 3, 4]));
   assert.deepEqual(
@@ -70,4 +91,44 @@ test("streams enforce length, digest, ranges and early receiver completion", asy
     () => {},
   );
   await assert.rejects(collect(corrupt.stream, 4), /integrity/);
+});
+
+test("message codec preserves node normalization and legacy empty attachment slots", () => {
+  const expected = `[1,42,"${"a".repeat(64)}","sealed",[]]`;
+  assert.equal(
+    Buffer.from(
+      encodeMessage({
+        messageId: 42,
+        senderAddressHash: "A".repeat(64),
+        sealedHeader: "sealed",
+        encryptedAttachmentDescriptors: [],
+      }),
+    ).toString(),
+    expected,
+  );
+  for (const empty of [null, false, 0, ""]) {
+    assert.deepEqual(
+      decodeMessage(Buffer.from(JSON.stringify([1, 42, "A".repeat(64), "sealed", empty]))),
+      {
+        messageId: 42,
+        senderAddressHash: "a".repeat(64),
+        sealedHeader: "sealed",
+        encryptedAttachmentDescriptors: [],
+      },
+    );
+  }
+  for (const invalid of [true, {}, [""], Array(21).fill("sealed")]) {
+    assert.throws(() =>
+      decodeMessage(Buffer.from(JSON.stringify([1, 42, "a".repeat(64), "sealed", invalid]))),
+    );
+  }
+});
+
+test("message text decoding matches the existing node replacement semantics", () => {
+  const bytes = Buffer.concat([
+    Buffer.from(`[1,42,"${"a".repeat(64)}","`),
+    Buffer.from([0xff]),
+    Buffer.from('",[]]'),
+  ]);
+  assert.equal(decodeMessage(bytes).sealedHeader, "\uFFFD");
 });

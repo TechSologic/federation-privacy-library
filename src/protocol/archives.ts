@@ -203,14 +203,14 @@ export function parsePointer(value: unknown, archiveId: string): Record<string, 
 export function verifyPointer(
   value: unknown,
   archiveId: string,
-  predecessor: string | null,
+  predecessor: string | null | undefined,
   authority: TrustedAuthority,
 ): ArchiveVersion {
   const p = parsePointer(value, archiveId);
   const binding = readDocument(authority.bindings);
   if (
     binding.canWrite !== true ||
-    p.previousPointerHash !== (predecessor ?? "") ||
+    (predecessor !== undefined && p.previousPointerHash !== (predecessor ?? "")) ||
     ["writerAccessId", "signingKeyId", "spaceAuthorityId", "spaceKeyEpochHash"].some(
       (key) => binding[key] !== p[key],
     )
@@ -218,5 +218,11 @@ export function verifyPointer(
     fail("unauthorized", "Version authority mismatch");
   const { signature, ...unsigned } = p;
   verifySignature(unsigned, signature, authority, p.signingKeyId);
-  return { hash: p.pointerHash, predecessor, signed: document(p) };
+  return {
+    hash: p.pointerHash,
+    predecessor: p.previousPointerHash || null,
+    sequence: p.sequence,
+    issuedAt: p.issuedAt,
+    signed: document(p),
+  };
 }

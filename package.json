@@ -1,9 +1,10 @@
 {
   "name": "@techsologic/federation-privacy-library",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-beta.1",
   "type": "module",
   "description": "Federated address discovery and encrypted data transport.",
   "license": "AGPL-3.0-only",
+  "author": "Michael Stapleton <mike@techsologic.com>",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/TechSologic/federation-privacy-library.git"
@@ -20,13 +21,9 @@
       "types": "./dist/testing/index.d.ts",
       "import": "./dist/testing/index.js"
     },
-    "./adapters/memory": {
-      "types": "./dist/adapters/memory.d.ts",
-      "import": "./dist/adapters/memory.js"
-    },
-    "./protocol": {
-      "types": "./dist/protocol/index.d.ts",
-      "import": "./dist/protocol/index.js"
+    "./adapters": {
+      "types": "./dist/adapters/index.d.ts",
+      "import": "./dist/adapters/index.js"
     }
   },
   "files": [
@@ -34,7 +31,16 @@
     "LICENSE",
     "NOTICE.md",
     "README.md",
-    "docs/runtime.md"
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "SUPPORT.md",
+    "docs/README.md",
+    "docs/using-library/*.md",
+    "docs/using-library/api-example.ts",
+    "examples/README.md",
+    "examples/two-nodes.mjs",
+    "examples/support/local-demo.mjs",
+    "scripts/run-example.mjs"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -45,14 +51,18 @@
     "test:unit": "tsc -p tsconfig.test.json && node scripts/run-tests.mjs unit",
     "test:e2e": "tsc -p tsconfig.test.json && node scripts/run-tests.mjs e2e",
     "test:tor": "tsc -p tsconfig.test.json && node scripts/run-tests.mjs tor",
-    "example": "npm run build && node examples/two-nodes.mjs",
+    "example": "npm run build && npm run example:check && node scripts/run-example.mjs",
+    "example:check": "tsc --allowJs --checkJs --strict --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --lib ES2022,DOM examples/two-nodes.mjs docs/using-library/api-example.ts",
     "prepack": "npm run build",
     "release:check": "node scripts/check-release.mjs",
     "release:pack": "node scripts/pack-release.mjs"
   },
   "devDependencies": {
-    "@types/node": "22.20.5",
     "prettier": "3.6.2",
     "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "@noble/post-quantum": "0.6.1",
+    "@types/node": "22.20.5"
   }
 }

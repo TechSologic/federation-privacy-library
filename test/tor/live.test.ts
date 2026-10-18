@@ -76,7 +76,8 @@ test(
       onionB = `http://${hostB.trim()}`;
     let received = 0;
     const a = createFederation({
-      ...config("a"),
+      storage: config("a").storage,
+      handlers: { authorization: config("a").authorization },
       tor: {
         onionService: onionA,
         socksProxy: { host: "127.0.0.1", port: socks },
@@ -85,15 +86,17 @@ test(
       },
     });
     const b = createFederation({
-      ...config("b"),
+      storage: config("b").storage,
       tor: {
         onionService: onionB,
         socksProxy: { host: "127.0.0.1", port: socks },
         listen: { host: "127.0.0.1", port: second },
         bootstrap: [{ onionService: onionA }],
       },
-      messages: {
-        receiver: {
+      handlers: {
+        authorization: config("b").authorization,
+        routes: config("b").routes,
+        messages: {
           async receive(stream) {
             await collect(stream, 256 * 1024);
             received++;

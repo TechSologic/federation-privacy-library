@@ -20,9 +20,10 @@ jobs:
     outputs:
       publish: ${{ steps.metadata.outputs.publish }}
       dist-tag: ${{ steps.metadata.outputs.dist_tag }}
+      package-sha256: ${{ steps.package.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: "24"
           package-manager-cache: false
@@ -38,7 +39,10 @@ jobs:
       - run: npm run example
       - name: Build, inspect, and install the release package
         run: npm run release:pack
-      - uses: actions/upload-artifact@v6
+      - name: Record validated package digest
+        id: package
+        run: echo "sha256=$(sha256sum .release/package.tgz | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: npm-package
           path: .release/package.tgz
@@ -59,17 +63,21 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
       - name: Install npm with trusted publishing support
-        run: npm install --global npm@11
-      - uses: actions/download-artifact@v7
+        run: npm install --global npm@11.21.0
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: npm-package
           path: .release
+      - name: Verify downloaded package digest
+        env:
+          EXPECTED_SHA256: ${{ needs.validate.outputs.package-sha256 }}
+        run: echo "$EXPECTED_SHA256  .release/package.tgz" | sha256sum --check --strict
       - name: Publish the validated artifact using OIDC
         env:
           NPM_DIST_TAG: ${{ needs.validate.outputs.dist-tag }}

@@ -6,6 +6,7 @@ import type {
   Stored,
   StateRecord,
   StateKey,
+  StorageFence,
   StorageMutation,
   StorageCommit,
   PageRequest,
@@ -34,6 +35,27 @@ export class MemoryFederationStorage implements FederationStorage {
     string,
     { changes: readonly StorageMutation[]; result: StorageCommit }
   >();
+  private currentLease?: { fence: StorageFence; expiresAt: number };
+  private nextEpoch = 0;
+  readonly lease = {
+    claim: async (owner: string, expiresAt: number): Promise<StorageFence | null> => {
+      if (!owner || owner.length > 256) fail("invalid-data", "Invalid lease owner");
+      integer(expiresAt, Date.now() + 1);
+      if (this.currentLease && this.currentLease.expiresAt > Date.now()) return null;
+      const fence = { owner, epoch: ++this.nextEpoch };
+      this.currentLease = { fence, expiresAt };
+      return structuredClone(fence);
+    },
+    renew: async (fence: StorageFence, expiresAt: number): Promise<boolean> => {
+      integer(expiresAt, Date.now() + 1);
+      if (!this.fenceIsCurrent(fence)) return false;
+      this.currentLease!.expiresAt = expiresAt;
+      return true;
+    },
+    release: async (fence: StorageFence): Promise<void> => {
+      if (this.fenceIsCurrent(fence)) this.currentLease = undefined;
+    },
+  };
   readonly addresses = {
     get: async (key: string) => structuredClone(this.addressRecords.get(key) ?? null),
     list: async (query: PageRequest & { enabled?: boolean }) =>
@@ -57,10 +79,23 @@ export class MemoryFederationStorage implements FederationStorage {
         query,
       ),
   };
-  async commit(commitId: string, changes: readonly StorageMutation[]): Promise<StorageCommit> {
+  private fenceIsCurrent(fence: StorageFence): boolean {
+    return (
+      this.currentLease !== undefined &&
+      this.currentLease.expiresAt > Date.now() &&
+      this.currentLease.fence.owner === fence.owner &&
+      this.currentLease.fence.epoch === fence.epoch
+    );
+  }
+  async commit(
+    commitId: string,
+    changes: readonly StorageMutation[],
+    fence: StorageFence,
+  ): Promise<StorageCommit> {
     changes = structuredClone(changes);
     if (!commitId || commitId.length > 256) fail("invalid-data", "Invalid commit identity");
     integer(changes.length, 1, 100);
+    if (!this.fenceIsCurrent(fence)) return { outcome: "fenced" };
     const old = this.commits.get(commitId);
     if (old) {
       if (!isDeepStrictEqual(old.changes, changes)) return { outcome: "conflict" };

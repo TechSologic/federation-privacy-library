@@ -1,5 +1,5 @@
 /**
- * Federation Privacy Library — proposed public contract.
+ * Federation Privacy Library — protocol and runtime value contracts.
  * Experimental public contracts. See README for implemented capabilities.
  * Copyright (c) 2026 TechSologic Inc. and contributors.
  * SPDX-License-Identifier: AGPL-3.0-only
@@ -86,6 +86,7 @@ export interface ResolvedAddress {
   readonly identity: AddressIdentity;
   readonly keys: AddressKeys;
   readonly policy: DeliveryPolicy;
+  /** Zero denotes a standing host binding. It does not override host admission policy. */
   readonly expiresAt: number;
   readonly routes: {
     readonly messageOnionService: string;
@@ -128,6 +129,10 @@ export interface StateRecord {
   readonly dueAt?: number;
 }
 export interface FederationStateStore {
+  /** State can contain encrypted payloads plus sensitive routing and operation
+   * metadata. Production adapters must encrypt records and indexes at rest,
+   * with keys managed separately from the stored data.
+   */
   get(key: StateKey): Promise<Stored<StateRecord> | null>;
   list(
     query: PageRequest & { readonly collection: string; readonly dueBefore?: number },
@@ -148,15 +153,38 @@ export type StorageMutation =
     };
 export type StorageCommit =
   | { readonly outcome: "committed"; readonly revisions: readonly (Revision | null)[] }
-  | { readonly outcome: "conflict" };
-/** One configurable storage object, with focused address and state interfaces. */
+  | { readonly outcome: "conflict" }
+  | { readonly outcome: "fenced" };
+/** Monotonically increasing ownership token issued by the storage adapter. */
+export interface StorageFence {
+  readonly owner: string;
+  readonly epoch: number;
+}
+export interface FederationLeaseStore {
+  /** Atomically claims an absent or expired lease and increments its epoch. */
+  claim(owner: string, expiresAt: number): Promise<StorageFence | null>;
+  /** Renews only the exact, unexpired fence. */
+  renew(fence: StorageFence, expiresAt: number): Promise<boolean>;
+  /** Releases only the exact fence; stale releases have no effect. */
+  release(fence: StorageFence): Promise<void>;
+}
+/** One configurable storage object, with focused address and state interfaces.
+ * Every production implementation must encrypt records, blobs, indexes, commit
+ * journals and backups at rest. Applications own key separation and rotation.
+ */
 export interface FederationStorage {
   readonly addresses: AddressStore;
   readonly state: FederationStateStore;
+  readonly lease: FederationLeaseStore;
   /** All mutations or none. Null expectation means absent; null value deletes.
-   * A retry of the same commitId and exact batch returns the original result.
+   * A retry of the same commitId, exact batch, and valid fence returns the original result.
+   * The adapter must atomically reject a stale or expired fence.
    */
-  commit(commitId: string, changes: readonly StorageMutation[]): Promise<StorageCommit>;
+  commit(
+    commitId: string,
+    changes: readonly StorageMutation[],
+    fence: StorageFence,
+  ): Promise<StorageCommit>;
 }
 
 export interface TransferFailure {
@@ -214,7 +242,7 @@ export type TransferEvent =
       readonly failure: TransferFailure;
     };
 export interface TransferListener {
-  onEvent(event: TransferEvent): void;
+  onEvent(event: TransferEvent): void | Promise<void>;
 }
 export type TransferResult =
   | { readonly kind: "message"; readonly outcome: "delivered" }
@@ -253,16 +281,15 @@ export interface SendOptions extends CallOptions {
   /** Stable application idempotency key for an exact retry of submission. */
   readonly operationId?: OperationId;
 }
-/** Structural error contract; no runtime error constructor is proposed here. */
-export interface SubmissionError extends Error {
-  readonly failure: TransferFailure;
-  readonly outcome: "not-queued" | "unknown";
-  readonly operationId: OperationId;
-}
+/** Submission failures have an exported constructor and an explicit durable outcome. */
+export type SubmissionError = import("./submission.js").FederationSubmissionError;
 
 export interface EncryptedMessage {
   readonly messageId: number;
   readonly senderAddressHash: AddressHash;
+  /** Application-encrypted header containing an application signature. The
+   * library deliberately cannot decrypt or verify that signature.
+   */
   readonly sealedHeader: string;
   readonly encryptedAttachmentDescriptors: readonly string[];
 }
@@ -279,12 +306,16 @@ export interface ReceiveError extends Error {
 export interface MessageReceiver {
   /** Reads the complete encoded encrypted envelope. May persist it in a durable
    * application queue. Resolution means durable node custody; exact repeats
-   * resolve successfully without duplicating effects. No inbox workflow is required.
+   * resolve successfully without duplicating effects. The receiving application
+   * MUST decrypt and validate its signature before any message effect. The
+   * federation library does not validate application message signatures.
    */
   receive(stream: ByteStream, metadata: MessageMetadata): Promise<void>;
 }
 export interface MessageApi {
-  /** Encodes existing encrypted fields into the current protocol envelope; no encryption. */
+  /** Encodes existing encrypted, application-signed fields into the current
+   * protocol envelope. It performs neither encryption nor signature validation.
+   */
   source(message: EncryptedMessage): DataSource;
   /** Source streams a complete encoded envelope. Resolves after durable local queuing. */
   send(
@@ -333,10 +364,14 @@ export interface ArchiveReceiveMetadata {
   readonly expectedRevision: Revision | null;
   /** Byte interval in this receive call; an upload may be received in multiple parts. */
   readonly range: ByteRange;
+  /** Storage ownership that the receiver must reject after it becomes stale. */
+  readonly fence: StorageFence;
   readonly signal: AbortSignal;
 }
 export interface ArchiveReceiver {
-  /** Resolves after the supplied interval is durably staged, still invisible to readers. */
+  /** Resolves after the supplied interval is durably staged, still invisible to readers.
+   * The receiver must atomically reject metadata.fence after a newer lease is issued.
+   */
   receive(stream: ByteStream, metadata: ArchiveReceiveMetadata): Promise<void>;
 }
 export interface ArchiveReadReceiver {
@@ -346,8 +381,10 @@ export interface ArchiveReadReceiver {
     metadata: {
       readonly operationId: OperationId;
       readonly archive: ArchiveReference;
-      readonly info: CiphertextInfo;
+      readonly info: ArchiveInfo;
       readonly range: ByteRange;
+      /** Digest of the bytes in this receive call. */
+      readonly streamSha256: string;
       readonly signal: AbortSignal;
     },
   ): Promise<void>;
@@ -355,6 +392,8 @@ export interface ArchiveReadReceiver {
 export interface ArchiveVersion {
   readonly hash: string;
   readonly predecessor: string | null;
+  readonly sequence: number;
+  readonly issuedAt: number;
   readonly signed: ProtocolDocument;
 }
 export type VersionCommit =
@@ -365,7 +404,35 @@ export interface ArchiveRequestOptions extends CallOptions {
   readonly proofs?: ProofProvider;
   /** Trusted operation context, including authority and existing control metadata. */
   readonly context?: ProtocolDocument;
+  /** Trusted authority used to authenticate returned signed version heads. */
+  readonly authority?: TrustedAuthority;
 }
+export type ArchiveHeadFreshness =
+  | {
+      /** Explicit first-use trust: no previously observed head is available. */
+      readonly minimumSequence: 0;
+      readonly hashAtMinimum?: never;
+    }
+  | {
+      /** Last trusted sequence observed by the application. */
+      readonly minimumSequence: number;
+      /** Exact trusted hash at minimumSequence. */
+      readonly hashAtMinimum: string;
+    };
+export interface ArchiveHeadOptions extends ArchiveRequestOptions {
+  readonly freshness: ArchiveHeadFreshness;
+}
+export type ArchiveReadOptions =
+  | {
+      readonly range?: undefined;
+      readonly expectedInfo: ArchiveInfo;
+    }
+  | {
+      readonly range: ByteRange;
+      readonly expectedInfo: ArchiveInfo;
+      /** Trusted digest of exactly the requested range. */
+      readonly expectedRangeSha256: string;
+    };
 export interface ArchiveApi {
   create(
     destination: Destination,
@@ -396,13 +463,13 @@ export interface ArchiveApi {
     destination: Destination,
     archive: ArchiveReference,
     receiver: ArchiveReadReceiver,
-    listener?: TransferListener,
-    options?: SendOptions & ArchiveRequestOptions & { readonly range?: ByteRange },
+    listener: TransferListener | undefined,
+    options: SendOptions & ArchiveRequestOptions & ArchiveReadOptions,
   ): Promise<Transfer>;
   head(
     destination: Destination,
     archive: ArchiveReference,
-    options?: ArchiveRequestOptions,
+    options: ArchiveHeadOptions,
   ): Promise<ArchiveVersion | null>;
   commitVersion(
     destination: Destination,
@@ -416,20 +483,42 @@ export interface ArchiveApi {
 }
 
 /** Data access used when this host serves peers. Protocol/auth checks remain in the library. */
+export interface ArchiveStoreCall {
+  /** Adapters must stop cancellable work and perform no later durable mutation after abort. */
+  readonly signal: AbortSignal;
+}
 export interface ArchiveStore {
+  /** Mutating methods must atomically reject stale fences against the same lease
+   * authority used by FederationStorage.
+   */
   create(
     operationId: OperationId,
     collection: ArchiveCollection,
     description: ProtocolDocument,
+    fence: StorageFence,
+    options: ArchiveStoreCall,
   ): Promise<ArchiveDescription>;
-  list(collection: ArchiveCollection, query: PageRequest): Promise<ArchiveList>;
-  stat(archive: ArchiveReference): Promise<ArchiveDescription | null>;
+  /** Cursor values must be authenticated and scoped to this exact collection. */
+  list(
+    collection: ArchiveCollection,
+    query: PageRequest,
+    options: ArchiveStoreCall,
+  ): Promise<ArchiveList>;
+  stat(archive: ArchiveReference, options: ArchiveStoreCall): Promise<ArchiveDescription | null>;
   open(
     archive: ArchiveReference,
-    options: CallOptions & { readonly range?: ByteRange },
+    options: ArchiveStoreCall & { readonly range?: ByteRange },
   ): Promise<ByteStream>;
-  remove(operationId: OperationId, archive: ArchiveReference): Promise<void>;
-  inspectStage(stageId: string): Promise<
+  remove(
+    operationId: OperationId,
+    archive: ArchiveReference,
+    fence: StorageFence,
+    options: ArchiveStoreCall,
+  ): Promise<void>;
+  inspectStage(
+    stageId: string,
+    options: ArchiveStoreCall,
+  ): Promise<
     | { readonly state: "absent" }
     | {
         readonly state: "staged";
@@ -446,7 +535,7 @@ export interface ArchiveStore {
   >;
   openStage(
     stageId: string,
-    options: CallOptions & { readonly range?: ByteRange },
+    options: ArchiveStoreCall & { readonly range?: ByteRange },
   ): Promise<ByteStream>;
   /** Called only after complete encrypted length and integrity verification.
    * For mutable archives this commits immutable content, not the visible head.
@@ -457,12 +546,18 @@ export interface ArchiveStore {
     archive: ArchiveReference,
     verified: ArchiveInfo,
     expectedRevision: Revision | null,
+    fence: StorageFence,
+    options: ArchiveStoreCall,
   ): Promise<
     | { readonly outcome: "committed"; readonly revision: Revision }
     | { readonly outcome: "conflict" }
   >;
-  discardStage(stageId: string): Promise<"discarded" | "already-committed" | "pending">;
-  head(archive: ArchiveReference): Promise<ArchiveVersion | null>;
+  discardStage(
+    stageId: string,
+    fence: StorageFence,
+    options: ArchiveStoreCall,
+  ): Promise<"discarded" | "already-committed" | "pending">;
+  head(archive: ArchiveReference, options: ArchiveStoreCall): Promise<ArchiveVersion | null>;
   /** Atomically check the predecessor and referenced stored content before publishing
    * the verified version. Concurrent removal must not publish a dangling head. */
   commitVersion(
@@ -470,6 +565,8 @@ export interface ArchiveStore {
     archive: ArchiveReference,
     expectedPredecessor: string | null,
     verifiedSuccessor: ArchiveVersion,
+    fence: StorageFence,
+    options: ArchiveStoreCall,
   ): Promise<VersionCommit>;
 }
 
@@ -503,6 +600,13 @@ export interface TrustedAuthority {
   readonly keys: readonly { readonly keyId: string | number; readonly publicKey: string }[];
   /** Existing protocol authority/scope bindings, sourced from trusted app records. */
   readonly bindings: ProtocolDocument;
+  /** Trusted storage scope for legacy control requests whose outer collection
+   * selector is not covered by the v1 request signature.
+   */
+  readonly archiveCollection?: {
+    readonly id: string;
+    readonly authorityArchiveId: string;
+  };
 }
 export interface AuthorizationHandler {
   /** Bounded, read-only lookup. Submitted proofs cannot install their own authority. */
@@ -520,6 +624,18 @@ export interface ProofProvider {
     readonly signal: AbortSignal;
   }): Promise<readonly ProtocolDocument[]>;
 }
+export interface AddressRouteProofProvider {
+  /** Obtain a client signature over the exact route bytes. The provider may
+   * bridge to a client; the federation host never receives the private key.
+   * The initial standing authorization fixes the address to its original node.
+   * Routine publication reuses it; a different node requires a new address.
+   */
+  authorize(request: {
+    readonly route: import("./protocol/addressRoutes.js").AddressRouteAuthorizationInput;
+    readonly canonicalRequest: Uint8Array;
+    readonly signal: AbortSignal;
+  }): Promise<{ readonly signature: string }>;
+}
 export interface TorConfiguration {
   readonly onionService: string;
   readonly socksProxy: { readonly host: string; readonly port: number };
@@ -531,7 +647,7 @@ export interface RuntimeStatus {
   readonly reason?: "tor-unavailable" | "storage-unavailable" | "identity-mismatch" | "capacity";
 }
 export interface RuntimeListener {
-  onState(status: RuntimeStatus): void;
+  onState(status: RuntimeStatus): void | Promise<void>;
 }
 export interface FederationLimits {
   readonly maxMessageBytes: number;
@@ -541,6 +657,10 @@ export interface FederationLimits {
   readonly maxPendingOperations: number;
   readonly maxAttempts: number;
   readonly operationRetentionMs: number;
+  /** Absolute wall-clock lifetime for protocol control requests. */
+  readonly controlRequestDeadlineMs: number;
+  /** Absolute wall-clock lifetime for streaming encrypted archive bytes. */
+  readonly archiveRequestDeadlineMs: number;
 }
 export interface FederationConfiguration {
   readonly storage: FederationStorage;
@@ -556,8 +676,9 @@ export interface FederationConfiguration {
   /** Missing policy denies incoming application operations. */
   readonly authorization?: AuthorizationHandler;
   readonly proofs?: ProofProvider;
+  readonly routes?: AddressRouteProofProvider;
   readonly listener?: RuntimeListener;
-  /** Bounded defaults will be specified with the implementation; invalid values fail startup. */
+  /** Bounded runtime defaults are documented in docs/using-library/runtime.md; invalid values fail construction. */
   readonly limits?: Partial<FederationLimits>;
 }
 export interface Federation {
