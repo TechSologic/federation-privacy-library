@@ -236,6 +236,15 @@ or a missing head after an observed sequence.
   suspend the other queues. A peer receives a timeout response at the deadline;
   a non-cooperative handler continues to occupy one of the 16 admission slots
   until its adapter work actually settles.
+- The built-in connector bounds local proxy connection and method negotiation
+  separately at five seconds each. Onion descriptor lookup and rendezvous may
+  use the remaining request deadline, capped at 60 seconds for connection
+  establishment across at most three attempts. Only temporary SOCKS connection
+  failures are retried, with a bounded delay and no application bytes sent until
+  a connection succeeds. Invalid descriptors or addresses, missing or incorrect
+  client authorization, and malformed replies are terminal. Caller cancellation,
+  a lower request deadline, or transport shutdown interrupts preparation and
+  retries. This does not replay HTTP requests or change host transport providers.
 - Archive listing uses a fixed wire page size, so `limit` must be 64. Receiving multipart uploads accepts sequential parts, including
   exact retries. Arbitrarily reordered parts are not supported.
 - Cancellation attempts remote multipart cleanup, but cleanup after an offline

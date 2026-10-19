@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### 0.1.0-beta.2
+
+- Allow slow onion connection establishment to use the existing request deadline
+  instead of an internal 15-second cutoff; public interfaces and configured
+  request deadlines are unchanged.
+- Retry temporary SOCKS connection failures at most three times before sending
+  application data. Invalid targets, descriptors, client authorization failures
+  and malformed replies stop immediately; HTTP requests are not replayed.
+- Cancel connection preparation and retry delays during transport shutdown or
+  caller cancellation.
+
+## 0.1.0-beta.1
+
 ### Initial Snapshot
 
 Package version: `0.1.0-beta.1`.
@@ -24,5 +37,5 @@ Package version: `0.1.0-beta.1`.
   architecture and integration guides, tests and package validation tooling.
 
 The API is experimental. See the [runtime contracts](docs/using-library/runtime.md)
-for supported behavior and limits. This snapshot does not designate a published
-release or production qualification.
+for supported behavior and limits. Package publication does not establish
+production qualification, application integration or deployment.
