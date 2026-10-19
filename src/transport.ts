@@ -9,6 +9,7 @@ import {
 import { connect, type Socket } from "node:net";
 import { Readable } from "node:stream";
 import { once } from "node:events";
+import { setTimeout as delay } from "node:timers/promises";
 import type { ByteStream, TorConfiguration } from "./contracts.js";
 import { onion } from "./address.js";
 import { collect } from "./streams.js";
@@ -66,6 +67,7 @@ const deadlineClass = (path: string): "control" | "archive" =>
 export class HttpWire {
   private server?: Server;
   private readonly agents = new Set<Agent>();
+  private readonly connecting = new Set<AbortController>();
   private readonly requests = new Set<AbortController>();
   constructor(
     readonly connector: Connector,
@@ -225,14 +227,26 @@ export class HttpWire {
   async request(endpoint: string, input: WireRequest): Promise<WireResponse> {
     onion(endpoint);
     input.signal.throwIfAborted();
+    const control = new AbortController();
     const signal = AbortSignal.any([
       input.signal,
+      control.signal,
       AbortSignal.timeout(this.deadline(input.path, input.deadlineClass)),
     ]);
     if (!input.path.startsWith("/") || input.path.includes("\r") || input.path.includes("\n"))
       fail("invalid-data", "Invalid protocol path");
     const url = new URL(endpoint);
-    const socket = await this.connector.connect(endpoint, signal);
+    this.connecting.add(control);
+    let socket: Socket | undefined;
+    try {
+      socket = await this.connector.connect(endpoint, signal);
+      signal.throwIfAborted();
+    } catch (error) {
+      socket?.destroy();
+      throw error;
+    } finally {
+      this.connecting.delete(control);
+    }
     const agent = new Agent({ keepAlive: false });
     this.agents.add(agent);
     agent.createConnection = (() => socket) as typeof agent.createConnection;
@@ -329,6 +343,8 @@ export class HttpWire {
     }
   }
   async stop(): Promise<void> {
+    for (const control of this.connecting) control.abort();
+    this.connecting.clear();
     for (const control of this.requests) control.abort();
     for (const agent of this.agents) agent.destroy();
     this.agents.clear();
@@ -420,40 +436,63 @@ export function torConnector(config: TorConfiguration): Connector {
     },
     async connect(endpoint, signal) {
       const url = new URL(onion(endpoint));
-      const bounded = AbortSignal.any([signal, AbortSignal.timeout(15_000)]);
-      const socket = await localConnect(config.socksProxy.host, config.socksProxy.port, bounded);
-      try {
-        socket.write(Buffer.from([5, 1, 0]));
-        const method = await readExactly(socket, 2, bounded);
-        if (method[0] !== 5 || method[1] !== 0)
-          fail("unavailable", "Tor proxy refused authentication method", true);
-        const host = Buffer.from(url.hostname, "ascii");
-        const port = Number(url.port || 80);
-        socket.write(
-          Buffer.concat([
-            Buffer.from([5, 1, 0, 3, host.length]),
-            host,
-            Buffer.from([port >> 8, port & 255]),
-          ]),
+      // Local proxy work is short; Tor descriptor lookup and rendezvous may use
+      // the remaining request budget. Retries never send application bytes.
+      const bounded = AbortSignal.any([signal, AbortSignal.timeout(defaultDeadlines.controlMs)]);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        bounded.throwIfAborted();
+        const socket = await localConnect(
+          config.socksProxy.host,
+          config.socksProxy.port,
+          AbortSignal.any([bounded, AbortSignal.timeout(5000)]),
         );
-        const reply = await readExactly(socket, 4, bounded);
-        if (reply[0] !== 5 || reply[1] !== 0 || reply[2] !== 0)
-          fail("unavailable", "Tor proxy could not connect", true);
-        const length =
-          reply[3] === 1
-            ? 4
-            : reply[3] === 4
-              ? 16
-              : reply[3] === 3
-                ? (await readExactly(socket, 1, bounded))[0]
-                : -1;
-        if (length < 0) fail("invalid-data", "Invalid Tor proxy response");
-        await readExactly(socket, length + 2, bounded);
-        return socket;
-      } catch (error) {
-        socket.destroy();
-        throw error;
+        try {
+          socket.write(Buffer.from([5, 1, 0]));
+          const method = await readExactly(
+            socket,
+            2,
+            AbortSignal.any([bounded, AbortSignal.timeout(5000)]),
+          );
+          if (method[0] !== 5) fail("invalid-data", "Invalid Tor proxy response");
+          if (method[1] !== 0) fail("unavailable", "Tor proxy refused authentication method");
+          const host = Buffer.from(url.hostname, "ascii");
+          const port = Number(url.port || 80);
+          socket.write(
+            Buffer.concat([
+              Buffer.from([5, 1, 0, 3, host.length]),
+              host,
+              Buffer.from([port >> 8, port & 255]),
+            ]),
+          );
+          const reply = await readExactly(socket, 4, bounded);
+          if (reply[0] !== 5 || reply[2] !== 0) fail("invalid-data", "Invalid Tor proxy response");
+          if (reply[1] !== 0)
+            fail("unavailable", "Tor proxy could not connect", retryableOnionReplies.has(reply[1]));
+          const length =
+            reply[3] === 1
+              ? 4
+              : reply[3] === 4
+                ? 16
+                : reply[3] === 3
+                  ? (await readExactly(socket, 1, bounded))[0]
+                  : -1;
+          if (length < 0) fail("invalid-data", "Invalid Tor proxy response");
+          await readExactly(socket, length + 2, bounded);
+          return socket;
+        } catch (error) {
+          socket.destroy();
+          bounded.throwIfAborted();
+          if (!(error instanceof FederationError) || !error.retryable || attempt === 2) throw error;
+        }
+        await delay(250 * (attempt + 1), undefined, { signal: bounded });
       }
+      fail("unavailable", "Tor proxy could not connect", true);
     },
   };
 }
+
+// Tor SOCKS extension failures: descriptor unavailable, introduction failure,
+// rendezvous failure and introduction timeout are temporary. Invalid targets,
+// descriptors and missing/revoked client authorization are terminal.
+// https://spec.torproject.org/socks-extensions.html#extended-error-codes
+const retryableOnionReplies = new Set([0x01, 0x03, 0x04, 0x05, 0x06, 0xf0, 0xf2, 0xf3, 0xf7]);

@@ -35,7 +35,7 @@ for supported limits. Local tests do not establish production readiness.
 Use Node.js 22 or later and an ESM application. Pin the beta explicitly:
 
 ```bash
-npm install --save-exact @techsologic/federation-privacy-library@0.1.0-beta.1
+npm install --save-exact @techsologic/federation-privacy-library@0.1.0-beta.2
 ```
 
 Prereleases are published under `next`; `latest` is a separate channel. Use the
