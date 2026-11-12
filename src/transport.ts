@@ -15,6 +15,8 @@ import { onion } from "./address.js";
 import { collect } from "./streams.js";
 import { fail, FederationError, integer } from "./errors.js";
 import { lookupRequestMaxBytes } from "./protocol/lookup.js";
+import type { FederationNetworking } from "./networking.js";
+import { federationDirectPathPrefix } from "./protocol/networking.js";
 
 export interface WireRequest {
   method?: "GET" | "POST" | "PUT";
@@ -32,10 +34,12 @@ export interface WireResponse {
   body: ByteStream;
 }
 export interface Connector {
+  network?: FederationNetworking;
   connect(endpoint: string, signal: AbortSignal): Promise<Socket>;
   probe?(signal: AbortSignal): Promise<void>;
 }
 export type WireHandler = (request: {
+  ingress: "tor" | "direct";
   path: string;
   method: string;
   headers: Record<string, string>;
@@ -63,12 +67,15 @@ const archiveStreamPaths = new Set([
 ]);
 const deadlineClass = (path: string): "control" | "archive" =>
   archiveStreamPaths.has(path) ? "archive" : "control";
+const maxConcurrentRequests = 16;
+const maxConcurrentDirectRequests = 8;
 
 export class HttpWire {
   private server?: Server;
   private readonly agents = new Set<Agent>();
   private readonly connecting = new Set<AbortController>();
   private readonly requests = new Set<AbortController>();
+  private readonly directRequests = new Set<AbortController>();
   constructor(
     readonly connector: Connector,
     private readonly config: TorConfiguration,
@@ -81,14 +88,21 @@ export class HttpWire {
   }
   private readonly deadlines: WireDeadlines;
   private deadline(path: string, requested?: "control" | "archive"): number {
+    // The public HTTPS namespace must preserve the archive streaming deadline.
+    if (path.startsWith(federationDirectPathPrefix + "/"))
+      path = path.slice(federationDirectPathPrefix.length);
     const kind = requested ?? deadlineClass(path);
     return kind === "archive" ? this.deadlines.archiveMs : this.deadlines.controlMs;
   }
   async start(handler: WireHandler): Promise<number> {
     if (this.server) fail("conflict", "Listener already started");
     this.server = createServer({ maxHeaderSize: 16 * 1024 }, (req, res) => {
+      const direct = (req.url ?? "").startsWith(federationDirectPathPrefix + "/");
       // Hold admission for the entire response stream, including archive reads.
-      if (this.requests.size >= 16) {
+      if (
+        this.requests.size >= maxConcurrentRequests ||
+        (direct && this.directRequests.size >= maxConcurrentDirectRequests)
+      ) {
         res.writeHead(503, {
           "content-type": "application/json",
           connection: "close",
@@ -103,11 +117,15 @@ export class HttpWire {
         AbortSignal.timeout(this.deadline(req.url ?? "")),
       ]);
       this.requests.add(control);
+      if (direct) this.directRequests.add(control);
       req.once("aborted", () => control.abort());
       res.once("close", () => {
         if (!res.writableFinished) control.abort();
       });
-      void this.respond(req, res, signal, handler).finally(() => this.requests.delete(control));
+      void this.respond(req, res, signal, direct ? "direct" : "tor", handler).finally(() => {
+        this.requests.delete(control);
+        this.directRequests.delete(control);
+      });
     });
     this.server.maxHeadersCount = 64;
     this.server.maxConnections = 64;
@@ -129,23 +147,23 @@ export class HttpWire {
     req: IncomingMessage,
     res: ServerResponse,
     signal: AbortSignal,
+    ingress: "tor" | "direct",
     handler: WireHandler,
   ) {
     let operation: ReturnType<WireHandler> | undefined;
     try {
-      const path = req.url ?? "";
+      let path = req.url ?? "";
       if (!path.startsWith("/") || path.includes("?") || path.includes("#"))
         fail("invalid-data", "Invalid protocol path");
       const headers: Record<string, string> = {};
       for (const [name, value] of Object.entries(req.headers))
         if (typeof value === "string") headers[name] = value;
-      operation = handler({
-        path,
-        method: req.method ?? "",
-        headers,
-        signal,
-        body: Readable.toWeb(req) as ByteStream,
-      });
+      if (path.startsWith(federationDirectPathPrefix + "/")) {
+        if (!this.connector.network?.enabled) fail("unauthorized", "Direct networking is disabled");
+        path = path.slice(federationDirectPathPrefix.length);
+      }
+      const body = Readable.toWeb(req) as ByteStream;
+      operation = handler({ ingress, path, method: req.method ?? "", headers, body, signal });
       const result = await this.untilAborted(operation, signal);
       res.writeHead(result.status, {
         "content-type": "application/json",
@@ -235,11 +253,19 @@ export class HttpWire {
     ]);
     if (!input.path.startsWith("/") || input.path.includes("\r") || input.path.includes("\n"))
       fail("invalid-data", "Invalid protocol path");
-    const url = new URL(endpoint);
+    let url = new URL(endpoint);
+    let pathPrefix = "";
+    let direct = false;
     this.connecting.add(control);
     let socket: Socket | undefined;
     try {
-      socket = await this.connector.connect(endpoint, signal);
+      if (this.connector.network) {
+        const connection = await this.connector.network.connect(endpoint, { signal });
+        socket = connection.socket;
+        url = new URL(connection.origin);
+        pathPrefix = connection.pathPrefix;
+        direct = connection.transport === "direct";
+      } else socket = await this.connector.connect(endpoint, signal);
       signal.throwIfAborted();
     } catch (error) {
       socket?.destroy();
@@ -257,14 +283,17 @@ export class HttpWire {
       const req = request(
         {
           hostname: url.hostname,
-          port: Number(url.port || 80),
+          port: Number(url.port || (direct ? 443 : 80)),
           method: input.method ?? "POST",
-          path: input.path,
+          path: pathPrefix + input.path,
           headers,
           agent,
           signal,
         },
         (response) => {
+          if (direct && (response.statusCode ?? 503) >= 400)
+            this.connector.network!.reportFailure(endpoint);
+          if (direct) response.once("error", () => this.connector.network!.reportFailure(endpoint));
           const returned: Record<string, string> = {};
           for (const [key, value] of Object.entries(response.headers))
             if (typeof value === "string") returned[key] = value;
@@ -282,6 +311,7 @@ export class HttpWire {
       // SOCKS framing pauses the socket between reads. HTTP now owns its reader.
       req.once("socket", (connected) => connected.resume());
       req.once("error", (error) => {
+        if (direct) this.connector.network!.reportFailure(endpoint);
         agent.destroy();
         this.agents.delete(agent);
         reject(error);
@@ -356,6 +386,7 @@ export class HttpWire {
         server.closeAllConnections();
       });
     this.requests.clear();
+    this.directRequests.clear();
   }
 }
 

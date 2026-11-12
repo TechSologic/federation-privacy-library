@@ -15,6 +15,11 @@ import type { FederationTransport } from "./delivery/transport.js";
 import type { FederationLookupRpcHttpTransport } from "./protocol/lookupRpcClient.js";
 import type { FederationLookupPublishSummary } from "./host/lookup.js";
 import type { DhtMaintenanceSummary } from "./dht/maintenance.js";
+import type {
+  FederationNetworkingConfiguration,
+  FederationOnionConnector,
+  FederationBootstrapStorage,
+} from "./networking.js";
 
 /** Atomic runtime state and existing host queues are independent capabilities.
  * Supply all three atomic-state capabilities together, or none. Never attach
@@ -35,6 +40,7 @@ export type FederationStorage = (
   readonly routing?: FederationDeliveryRoutingCache;
   readonly archives?: C.ArchiveStore;
   readonly sources?: C.SourceResolver;
+  readonly bootstrap?: FederationBootstrapStorage;
 };
 
 export type FederationEvent =
@@ -61,6 +67,8 @@ export interface FederationHandlers {
 
 /** Existing hosts inject bounded Tor I/O. Omit this to use the runtime Tor connector. */
 export interface FederationTransportProvider {
+  /** Required for optional direct networking in host integrations. Always connects through Tor. */
+  readonly onion?: FederationOnionConnector;
   readonly lookup?: FederationLookupRpcHttpTransport;
   readonly delivery?: FederationTransport;
 }
@@ -69,6 +77,7 @@ export interface FederationConfiguration {
   readonly storage: FederationStorage;
   readonly handlers?: FederationHandlers;
   readonly transport?: FederationTransportProvider;
+  readonly networking?: FederationNetworkingConfiguration;
   /** Required for the built-in listener; existing hosts may provide only identity/seeds. */
   readonly tor?: Partial<C.TorConfiguration>;
   /** Limits for atomic runtime capabilities; existing host queue policy is preserved. */
@@ -128,3 +137,10 @@ export type {
 } from "./protocol/lookupRpcClient.js";
 export type { FederationLookupResolution, FederationLookupPublishSummary } from "./host/lookup.js";
 export type { DhtContact, DhtRoutingEntry, DhtBucketSnapshot } from "./dht/routingTable.js";
+export type {
+  FederationNetworkingConfiguration,
+  FederationOnionConnector,
+  FederationNetworkConnection,
+  FederationNetworking,
+  FederationBootstrapStorage,
+} from "./networking.js";

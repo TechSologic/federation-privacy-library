@@ -1,7 +1,8 @@
 # Architecture
 
 Federation Privacy Library connects independently operated applications through
-address discovery and encrypted transfers over Tor. Applications construct one
+address discovery and encrypted transfers over Tor, with optional direct HTTPS
+between opted-in peers. Applications construct one
 `Federation` with `createFederation(configuration)`. The library owns protocol
 validation, discovery, publication, delivery scheduling, and transfer lifecycle.
 Applications supply persistence, encrypted content, access policy, and handlers.
@@ -54,6 +55,11 @@ on a configured loopback port; Tor forwards an onion service to that listener.
 The library does not install or launch Tor, create onion identities, or manage
 Tor configuration. Application transport providers serve the host queue path;
 they do not replace the built-in runtime's SOCKS connector.
+
+[Direct Networking](direct-networking.md) adds shared endpoint discovery and
+connection selection through the facade's `network` service. The built-in runtime
+uses it automatically; host transports call it for their own I/O. Its HTTPS
+capabilities are separate from signed address records, and Tor remains mandatory.
 
 ## Public Entry Points
 
@@ -117,7 +123,7 @@ under `storage`, `handlers`, and `transport`.
 | `SourceResolver`                        | Reopening archive sources after restart                                          | Resolve the persisted source ID to the same immutable ciphertext                                         |
 | `MessageReceiver`                       | Processing accepted ingress after policy checks                                  | Consume the entire envelope and durably store or queue it; deduplicate effects by `deliveryId`           |
 | `ArchiveReceiver`                       | Receiving an upload interval                                                     | Durably stage bytes without exposing them as committed; enforce signal and fence                         |
-| `ArchiveStore`                          | Reading staging, verifying/committing content and publishing versions            | Idempotent storage operations, cancellation, fencing and conditional version commits                     |
+| `ArchiveStore`                          | Reading staging, verifying/committing content and publishing versions            | Whole-object revision CAS, atomic head/object reads, conditional version commits, fencing and idempotency |
 | `ArchiveReadReceiver`                   | Downloading remote archive bytes                                                 | Consume into staging; expose content only after verified transfer completion                             |
 | `AuthorizationHandler`                  | Resolving authority and deciding access                                          | Trusted application-owned public authority and policy; peer-supplied proofs cannot install authority     |
 | `ProofProvider`                         | Preparing signed archive requests                                                | Operation-bound client-authorized proofs; no client private keys in the library                          |
@@ -248,21 +254,23 @@ sequenceDiagram
   Remote->>Remote: Verify required proofs and application authority
   Remote->>Store: Stage intervals using cancellation signal and storage fence
   Remote->>Store: Reread staging and verify encrypted length/digests
-  Remote->>Store: Commit content or preserve mutable staging
+  Remote->>Store: Atomically create/replace complete object if revision matches
   Remote-->>Sender: Protocol receipt
-  Sender-->>App: Completed with committed or staged result
-  opt Mutable version publication
+  Sender-->>App: Whole-object commit result and current revision
+  opt Signed-head metadata publication
     App->>Sender: commitVersion with client-signed successor and expected predecessor
     Sender->>Remote: Signed version commit
-    Remote->>Store: Atomically compare predecessor and publish verified version
+    Remote->>Store: Atomically compare object snapshot and predecessor; publish metadata
     Remote-->>Sender: Committed version or conflict
     Sender-->>App: Version result
   end
 ```
 
-Incoming staging remains separate from visible committed content. Downloads
+Incoming partial staging remains separate from visible committed content. A
+successful storage commit is a whole-object create or replacement; signed-head
+publication does not make bytes visible. Downloads
 require trusted encrypted-object metadata and verified completion before the
-application exposes received bytes. Mutable head reads also require a persisted
+application exposes received bytes. Signed-head reads also require a persisted
 freshness checkpoint. See [archive contracts](runtime.md#archive-streams-and-authorization).
 
 ## Lifecycle And Limits

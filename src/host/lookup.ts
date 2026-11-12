@@ -23,6 +23,7 @@ export interface FederationLookupCoordinatorOptions {
   rpcClient: Pick<FederationLookupRpcClient, "findValue" | "findNode" | "putValue"> &
     Partial<Pick<FederationLookupRpcClient, "ping">>;
   bootstrapPeers: FederationLookupPeer[];
+  directBootstrapPeers?(signal?: AbortSignal): Promise<FederationLookupPeer[]>;
   localOnionService?: string;
   publishQueue?: PublicationStorage | ClaimedPublicationStorage;
   maxPublishPeers?: number;
@@ -49,6 +50,7 @@ export class FederationLookupCoordinator {
   private readonly rpcClient: FederationLookupCoordinatorOptions["rpcClient"];
   private readonly localOnionService?: string;
   private readonly bootstrapPeers: FederationLookupPeer[];
+  private readonly directBootstrapPeers?: FederationLookupCoordinatorOptions["directBootstrapPeers"];
   private readonly publishQueue?: PublicationStorage | ClaimedPublicationStorage;
   private readonly maxPublishPeers: number;
   private readonly maxRetryBatch: number;
@@ -67,6 +69,7 @@ export class FederationLookupCoordinator {
       : undefined;
     if (this.localOnionService) this.localLookup.configureRouting(this.localOnionService);
     this.bootstrapPeers = options.bootstrapPeers.map(validatePeer);
+    this.directBootstrapPeers = options.directBootstrapPeers;
     this.publishQueue = options.publishQueue;
     this.isAddressActive = options.isAddressActive;
     this.maxPublishPeers = normalizeLimit(options.maxPublishPeers ?? 8, "maxPublishPeers");
@@ -79,7 +82,7 @@ export class FederationLookupCoordinator {
     if (this.localOnionService && this.rpcClient.ping) {
       this.maintenance = new DhtMaintenance({
         localId: toDhtContact({ onionService: this.localOnionService }).id,
-        seeds: async () => (await this.seeds()).map(toDhtContact),
+        seeds: async (signal) => (await this.seeds(signal)).map(toDhtContact),
         closest: async (key) => (await this.localLookup.findNode(key)).map(toDhtContact),
         oldest: async (limit) =>
           (await this.localLookup.findPeersForMaintenance(limit)).map(toDhtContact),
@@ -103,10 +106,12 @@ export class FederationLookupCoordinator {
     }
   }
 
-  private async seeds(): Promise<FederationLookupPeer[]> {
-    return this.localLookup.findBootstrapPeers
+  private async seeds(signal?: AbortSignal): Promise<FederationLookupPeer[]> {
+    const onion = this.localLookup.findBootstrapPeers
       ? (await this.localLookup.findBootstrapPeers()).map(validatePeer)
       : this.bootstrapPeers;
+    const direct = (await this.directBootstrapPeers?.(signal)) ?? [];
+    return [...new Map([...onion, ...direct].map((peer) => [peer.onionService, peer])).values()];
   }
 
   get joined(): boolean {
@@ -234,7 +239,7 @@ export class FederationLookupCoordinator {
         await this.rpcClient.putValue({ onionService: contact.endpoint }, record, requestSignal);
       },
       target: addressHash,
-      seeds: [...learned, ...(await this.seeds())].map(toDhtContact),
+      seeds: [...learned, ...(await this.seeds(signal))].map(toDhtContact),
       localId: this.localOnionService
         ? toDhtContact({ onionService: this.localOnionService }).id
         : undefined,
@@ -296,7 +301,7 @@ export class FederationLookupCoordinator {
     const learned = await this.localLookup.findNode(addressHash);
     // Distance ordering prefers nearby learned contacts. Keep configured seeds
     // as fallbacks in the same bounded walk if those contacts have gone away.
-    const bootstrap = await this.seeds();
+    const bootstrap = await this.seeds(signal);
     const seeds = [...learned, ...bootstrap];
     const result = await walkDht<{ value: FederationLookupValue; peer: string }>({
       target: addressHash,

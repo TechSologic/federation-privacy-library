@@ -2,7 +2,7 @@
 
 Applications construct one federation object through `createFederation` and supply
 `storage`, `handlers`, and Tor configuration or transport providers. The object
-exposes `addresses`, `messages`, `archives`, `transfers`, `peers`, and one
+exposes `addresses`, `messages`, `archives`, `transfers`, `peers`, `network`, and one
 `start`/`stop` lifecycle. Available operations depend on the configured capabilities.
 
 | Entry point  | Purpose                                                                             |
@@ -13,6 +13,9 @@ exposes `addresses`, `messages`, `archives`, `transfers`, `peers`, and one
 
 Use the [architecture capability matrix](architecture.md#capability-matrix) to
 choose providers for the operations your application needs.
+
+Optional `networking` configuration and the `network` service are described in
+[Direct Networking](direct-networking.md). Tor remains mandatory in both modes.
 
 Stateful coordinators and workers are internal. Applications use the facade
 rather than constructing its services.

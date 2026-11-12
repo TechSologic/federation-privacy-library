@@ -4,7 +4,7 @@ import { memorySource } from "../src/testing/index.js";
 import { collect } from "../src/streams.js";
 import { canonical, document } from "../src/protocol/archives.js";
 
-export function archivePolicy(mutable = false): {
+export function archivePolicy(): {
   authorization: C.AuthorizationHandler;
   proofs: C.ProofProvider;
   pointer: (
@@ -24,7 +24,6 @@ export function archivePolicy(mutable = false): {
     writerAccessId: "synthetic-writer",
     spaceKeyEpochHash: "synthetic-epoch",
     canWrite: true,
-    mutable,
   };
   const proofRequests: { operation: C.AuthorizedOperation; request: Record<string, any> }[] = [];
   const authorizationRequests: C.AuthorizationRequest[] = [];
@@ -216,6 +215,7 @@ export class TestArchives implements C.ArchiveStore, C.ArchiveReceiver {
     this.mutation(fence, options);
     this.data.delete(archive.id);
     this.descriptions.delete(archive.id);
+    this.versions.delete(archive.id);
   }
   async inspectStage(
     id: string,
@@ -286,20 +286,34 @@ export class TestArchives implements C.ArchiveStore, C.ArchiveReceiver {
     this.stages.delete(id);
     return "discarded";
   }
-  async head(archive: C.ArchiveReference, options: C.ArchiveStoreCall) {
+  async versionState(archive: C.ArchiveReference, options: C.ArchiveStoreCall) {
     this.active(options);
-    return this.versions.get(archive.id) ?? null;
+    const stored = this.data.get(archive.id);
+    return {
+      head: this.versions.get(archive.id) ?? null,
+      content: stored ? { revision: stored.revision, info: stored.info } : null,
+    };
   }
   async commitVersion(
     _id: string,
     archive: C.ArchiveReference,
     predecessor: string | null,
+    expectedContent: C.ArchiveObjectSnapshot,
     version: C.ArchiveVersion,
     fence: C.StorageFence,
     options: C.ArchiveStoreCall,
   ): Promise<C.VersionCommit> {
     this.mutation(fence, options);
+    const stored = this.data.get(archive.id);
     const current = this.versions.get(archive.id) ?? null;
+    if (
+      !stored ||
+      stored.revision !== expectedContent.revision ||
+      stored.info.byteLength !== expectedContent.info.byteLength ||
+      stored.info.sha256 !== expectedContent.info.sha256
+    )
+      return { outcome: "conflict", current };
+    if (current?.hash === version.hash) return { outcome: "committed", version: current };
     if ((current?.hash ?? null) !== predecessor) return { outcome: "conflict", current };
     this.versions.set(archive.id, version);
     return { outcome: "committed", version };

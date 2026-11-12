@@ -1,11 +1,44 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer as tcpServer, connect } from "node:net";
-import { createServer as httpServer } from "node:http";
+import { createServer as httpServer, request as httpRequest } from "node:http";
+import { Readable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { HttpWire, localConnect, torConnector } from "../../src/transport.js";
 import { config, endpoint } from "../helpers.js";
 import { collect } from "../../src/streams.js";
+import type { ByteStream } from "../../src/contracts.js";
+
+async function rawRequest(
+  port: number,
+  path: string,
+  method = "POST",
+  body?: Uint8Array,
+): Promise<{ status: number; body: Buffer }> {
+  return await new Promise((resolve, reject) => {
+    const request = httpRequest(
+      {
+        host: "127.0.0.1",
+        port,
+        path,
+        method,
+        headers: body ? { "content-length": String(body.byteLength) } : undefined,
+      },
+      async (response) => {
+        try {
+          resolve({
+            status: response.statusCode ?? 0,
+            body: Buffer.from(await collect(Readable.toWeb(response) as ByteStream, 8192)),
+          });
+        } catch (error) {
+          reject(error);
+        }
+      },
+    );
+    request.once("error", reject);
+    request.end(body);
+  });
+}
 test(
   "production transport uses SOCKS remote onion names and supports fragmented handshake replies",
   { timeout: 5000 },
@@ -116,6 +149,46 @@ test("a timed-out non-cooperative handler remains admission-counted", async (t) 
     JSON.parse(Buffer.from(await collect(throttled.body, 100)).toString()).type,
     "THROTTLED",
   );
+});
+
+test("direct requests cannot consume Tor request admission", async (t) => {
+  const settings = config("q").tor;
+  const server = new HttpWire(
+    {
+      connect: () => Promise.reject(new Error("Outbound connections are not used")),
+      network: { enabled: true } as never,
+    },
+    settings,
+    1000,
+  );
+  let entered = 0;
+  let release!: () => void;
+  const allEntered = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const port = await server.start(async (request) => {
+    if (request.path.startsWith("/synthetic-direct-hang-")) {
+      if (++entered === 8) release();
+      await new Promise<void>((resolve) =>
+        request.signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      return { status: 503 };
+    }
+    return { status: 200, body: Buffer.from('{"ok":true}') };
+  });
+  t.after(() => server.stop());
+  const pending = Array.from({ length: 8 }, (_, index) =>
+    rawRequest(port, `/federation-direct/synthetic-direct-hang-${index}`).catch(() => undefined),
+  );
+  await allEntered;
+  const excessDirect = await rawRequest(port, "/federation-direct/synthetic-direct-excess");
+  assert.equal(excessDirect.status, 503);
+  assert.deepEqual(JSON.parse(excessDirect.body.toString()), { type: "THROTTLED" });
+  const tor = await rawRequest(port, "/synthetic-tor-control");
+  assert.equal(tor.status, 200);
+  assert.deepEqual(JSON.parse(tor.body.toString()), { ok: true });
+  await server.stop();
+  await Promise.all(pending);
 });
 
 test("archive byte routes use the separate finite streaming deadline", async (t) => {

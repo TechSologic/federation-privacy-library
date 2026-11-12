@@ -8,9 +8,16 @@ prove that a recipient received or read a message.
 ## Tor And Diagnostics
 
 Operate Tor separately. When providing a transport, enforce finite I/O budgets,
-permitted onion endpoints and response bounds. Do not introduce clearnet fallback
-or follow arbitrary redirects. Tor does not remove timing, size or application
-behavior signals.
+permitted endpoints and response bounds. Direct HTTPS requires explicit opt-in
+and a current capability authenticated over onion; Tor-only mode never contacts
+direct endpoints. Do not follow redirects. Tor does not remove timing, size or
+application behavior signals.
+
+[Direct Networking](direct-networking.md) links a public HTTPS domain to the
+node's onion identity and reveals direct connection metadata. It adds Web PKI
+trust for transport and affects the whole hosting node. Turning it off later
+cannot erase information already observed. Application content encryption and
+authorization remain required and unchanged.
 
 The DHT resolves address hashes to onion services. Address-to-service association,
 including correlation between addresses hosted by one service, is an accepted

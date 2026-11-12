@@ -24,9 +24,12 @@ import {
   validateFederationOnionService,
 } from "./protocol/lookupRecords.js";
 import { encodeMessage } from "./protocol/messages.js";
+import { FederationNetwork, type FederationNetworking } from "./networking.js";
 
 /** Internal composition root. Consumers receive its service interfaces, never its engines. */
 export class FederationFacade {
+  private readonly networking: FederationNetwork;
+  readonly network: FederationNetworking;
   private readonly runtime?: C.Federation;
   private readonly lookup?: FederationLookupCoordinator;
   private readonly rpc?: FederationLookupRpcClient;
@@ -45,10 +48,17 @@ export class FederationFacade {
 
   constructor(
     private readonly config: FederationConfiguration,
-    runtimeFactory: (config: C.FederationConfiguration) => C.Federation = (config) =>
-      new FederationRuntime(config, torConnector(config.tor)),
+    runtimeFactory?: (config: C.FederationConfiguration) => C.Federation,
   ) {
-    const keys = new Set(["storage", "handlers", "transport", "tor", "limits", "scheduling"]);
+    const keys = new Set([
+      "storage",
+      "handlers",
+      "transport",
+      "tor",
+      "limits",
+      "scheduling",
+      "networking",
+    ]);
     if (Object.keys(config).some((key) => !keys.has(key)))
       this.invalid(
         "Unsupported federation configuration; use storage, handlers and transport providers",
@@ -56,6 +66,20 @@ export class FederationFacade {
     this.interval = integer(config.scheduling?.intervalMs ?? 60_000, 1_000, 3_600_000);
     this.batch = integer(config.scheduling?.batchSize ?? 16, 1, 128);
     const storage = config.storage;
+    const runtimeTor =
+      config.tor?.onionService &&
+      config.tor?.socksProxy &&
+      config.tor?.listen &&
+      config.tor?.bootstrap
+        ? torConnector(config.tor as C.TorConfiguration)
+        : undefined;
+    this.networking = new FederationNetwork(
+      config.tor?.onionService,
+      config.transport?.onion ?? runtimeTor,
+      config.networking,
+      storage.bootstrap,
+    );
+    this.network = this.networking;
     const atomic = [storage.addresses, storage.state, storage.lease, storage.commit];
     if (atomic.some(Boolean) && !atomic.every(Boolean))
       this.invalid("Atomic storage capabilities must be supplied together");
@@ -98,7 +122,11 @@ export class FederationFacade {
       )
         this.invalid("Runtime storage requires complete Tor configuration");
       // Separate capabilities may coexist, but must never own the same durable jobs.
-      this.runtime = runtimeFactory({
+      const buildRuntime =
+        runtimeFactory ??
+        ((runtimeConfig: C.FederationConfiguration) =>
+          new FederationRuntime(runtimeConfig, { ...runtimeTor!, network: this.network }));
+      this.runtime = buildRuntime({
         storage: storage as C.FederationStorage,
         tor: config.tor as C.TorConfiguration,
         sources: storage.sources,
@@ -124,6 +152,7 @@ export class FederationFacade {
         localLookup: storage.lookup,
         rpcClient: this.rpc!,
         bootstrapPeers: [...(config.tor?.bootstrap ?? [])],
+        directBootstrapPeers: (signal) => this.network.bootstrapPeers({ signal }),
         localOnionService: config.tor?.onionService,
         publishQueue: storage.publications,
         maxRetryBatch: this.batch,
@@ -349,6 +378,7 @@ export class FederationFacade {
   private async startOnce(options: C.CallOptions): Promise<C.RuntimeStatus> {
     options.signal?.throwIfAborted();
     this.current = { state: "starting" };
+    this.networking.resume();
     this.accepting = true;
     try {
       await this.runtime?.start(options);
@@ -430,6 +460,7 @@ export class FederationFacade {
       this.deliveryWorker?.stop(),
       this.delivery?.stopProcessing(),
       this.runtime?.stop(options),
+      this.networking.stop(),
     ]);
     await Promise.allSettled([...this.operations]);
     this.discoveryWorker = undefined;

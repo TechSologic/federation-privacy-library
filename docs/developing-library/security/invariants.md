@@ -20,9 +20,12 @@ independent security review already establish them.
    and protocol checks pass.
 6. DHT bootstrap peers are introductions, not identity authorities. An incomplete
    lookup is not evidence that an address does not exist.
-7. Production federation traffic uses the required Tor transport and permitted
-   protocol endpoints. Do not silently fall back to clearnet transport or follow
-   arbitrary redirects.
+7. Tor and each node's onion identity remain mandatory. Direct HTTPS is eligible
+   only under explicit local opt-in and a fresh remote capability authenticated
+   through that exact onion endpoint. Otherwise use Tor. Never silently enable
+   direct networking, follow redirects, or resolve direct DNS in Tor-only mode.
+   Direct mode adds public HTTPS certificate-authority trust and reveals network
+   metadata; it does not change membership, routing IDs or client authority.
 8. Tor endpoint authentication does not replace content encryption, recipient
    verification, or authorization.
 9. Keep raw receive addresses and client identity material outside server records
@@ -75,11 +78,16 @@ independent security review already establish them.
     Timed-out adapter work remains admission-counted until it actually settles.
 22. Verify encrypted length, digest, ranges, and applicable signed metadata.
     Do not expose partial or unverified data as a committed archive.
-23. Mutable versions use verified client-signed state and conditional predecessor
-    checks. Head reads reject state older than the caller's trusted sequence/hash
-    checkpoint. Conflicts must not silently overwrite an accepted version.
-24. Staging, commit, discard, cleanup, and recovery must be idempotent where
-    retries are allowed. Preserve recoverable state when commit outcome is unknown.
+23. Archive commits create or replace one complete object under an exact revision
+    condition. Incomplete stages remain invisible; random and partially visible
+    writes are outside the contract. Superseded provider data stays bounded.
+24. Signed versions use verified client state and atomically compare both the
+    current object snapshot and predecessor. Head reads reject state older than
+    the caller's trusted sequence/hash checkpoint. Conflicts must not silently
+    overwrite an object or accepted version, and a head for superseded bytes must
+    not be exposed as current metadata. Staging, commit, discard, cleanup,
+    and recovery remain idempotent where retries are allowed; preserve recoverable
+    state when a content commit outcome is unknown.
 25. Closing, cancellation, or source failure must release resources according
     to the documented lifecycle without corrupting accepted durable state.
     Adapters must not perform a late durable mutation after their signal aborts.

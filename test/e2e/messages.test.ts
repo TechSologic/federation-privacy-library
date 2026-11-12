@@ -1,10 +1,64 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { request as httpRequest } from "node:http";
+import { Readable } from "node:stream";
 import { TestNetwork } from "../../src/testing/index.js";
 import { collect } from "../../src/streams.js";
 import { encodeMessage, messagePath } from "../../src/protocol/messages.js";
-import { HttpWire } from "../../src/transport.js";
+import { gridPath } from "../../src/protocol/lookup.js";
+import {
+  federationDirectPathPrefix,
+  federationNetworkingPath,
+} from "../../src/protocol/networking.js";
+import { FederationRuntime } from "../../src/runtime.js";
+import { HttpWire, type Connector } from "../../src/transport.js";
+import type { ByteStream } from "../../src/contracts.js";
 import { address, config, endpoint, eventually, message } from "../helpers.js";
+
+async function rawRuntimeRequest(
+  port: number,
+  path: string,
+  method: "GET" | "POST",
+  body?: Uint8Array,
+): Promise<{ status: number; body: Buffer }> {
+  return await new Promise((resolve, reject) => {
+    const request = httpRequest(
+      {
+        host: "127.0.0.1",
+        port,
+        path,
+        method,
+        headers: body ? { "content-length": String(body.byteLength) } : undefined,
+      },
+      async (response) => {
+        try {
+          resolve({
+            status: response.statusCode ?? 0,
+            body: Buffer.from(await collect(Readable.toWeb(response) as ByteStream, 8192)),
+          });
+        } catch (error) {
+          reject(error);
+        }
+      },
+    );
+    request.once("error", reject);
+    request.end(body);
+  });
+}
+
+function invalidLookup(addressHash: string): string {
+  return Buffer.from(
+    JSON.stringify({
+      type: "unolock.receive.lookup.sealed.v1",
+      recordKey: addressHash,
+      cipherSuite: "AES-256-GCM",
+      nonce: "AA",
+      aad: "AA",
+      ciphertext: "AA",
+      tag: "AA",
+    }),
+  ).toString("base64url");
+}
 
 test("verified lookup bindings survive restart and do not require a reachable directory", async (t) => {
   const network = new TestNetwork();
@@ -74,6 +128,129 @@ test("a signed sealed route replicates over HTTP and is resolved through a separ
   const result = await sender.addresses.lookup(target.address);
   assert.deepEqual(result?.keys, target.record.keys);
   assert.equal(result?.routes.messageOnionService, endpoint("b"));
+});
+
+test("an invalid local replica cannot suppress an authentic signed route", async (t) => {
+  const network = new TestNetwork();
+  const senderConfig = config("c", ["b"]);
+  const sender = network.createRuntime(senderConfig);
+  const owner = network.createRuntime(config("b"));
+  const wire = new HttpWire(network.connector(), senderConfig.tor);
+  t.after(async () => Promise.all([wire.stop(), sender.stop(), owner.stop()]));
+  await Promise.all([sender.start(), owner.start()]);
+  const target = await address();
+  const hash = target.record.identity.addressHash;
+  await wire.json(
+    endpoint("c"),
+    gridPath + "put-value",
+    { type: "unolock.grid.putValue.v1", addressHash: hash, lookupValue: invalidLookup(hash) },
+    AbortSignal.timeout(2000),
+  );
+  await owner.addresses.register(target.record);
+  const resolved = await sender.addresses.lookup(target.address);
+  assert.deepEqual(resolved?.keys, target.record.keys);
+  assert.equal(resolved?.routes.messageOnionService, endpoint("b"));
+  assert.notEqual(
+    await senderConfig.storage.state.get({ collection: "replica", key: hash }),
+    null,
+    "candidate rejection must not mutate replica capacity state",
+  );
+});
+
+test("an invalid remote replica cannot terminate lookup before an authentic route", async (t) => {
+  const network = new TestNetwork();
+  const replica = network.createRuntime(config("a"));
+  const owner = network.createRuntime(config("b"));
+  const senderConfig = config("c", ["a"]);
+  const sender = network.createRuntime(senderConfig);
+  const wire = new HttpWire(network.connector(), senderConfig.tor);
+  t.after(async () => Promise.all([wire.stop(), replica.stop(), owner.stop(), sender.stop()]));
+  await Promise.all([replica.start(), owner.start(), sender.start()]);
+  const target = await address();
+  const hash = target.record.identity.addressHash;
+  await wire.json(
+    endpoint("a"),
+    gridPath + "put-value",
+    { type: "unolock.grid.putValue.v1", addressHash: hash, lookupValue: invalidLookup(hash) },
+    AbortSignal.timeout(2000),
+  );
+  await owner.addresses.register(target.record);
+  await wire.json(
+    endpoint("a"),
+    gridPath + "ping",
+    { type: "unolock.grid.ping.v1", onionService: endpoint("b") },
+    AbortSignal.timeout(2000),
+  );
+  await eventually(async () => {
+    const response = (await wire.json(
+      endpoint("a"),
+      gridPath + "find-node",
+      {
+        type: "unolock.grid.findNode.v1",
+        routingKey: Buffer.from(hash, "hex").toString("base64url"),
+      },
+      AbortSignal.timeout(2000),
+    )) as { peers?: { onionService?: string }[] };
+    return response.peers?.some((peer) => peer.onionService === endpoint("b")) ?? false;
+  });
+  const resolved = await sender.addresses.lookup(target.address);
+  assert.deepEqual(resolved?.keys, target.record.keys);
+  assert.equal(resolved?.routes.messageOnionService, endpoint("b"));
+});
+
+test("direct request-rate exhaustion does not throttle Tor", { timeout: 15000 }, async (t) => {
+  const network = new TestNetwork();
+  const cfg = config("r");
+  const base = network.connector();
+  const connector: Connector = {
+    ...base,
+    network: {
+      enabled: true,
+      async connect() {
+        throw new Error("Outbound networking is not used");
+      },
+      async bootstrap() {
+        throw new Error("Bootstrap is not used");
+      },
+      async bootstrapPeers() {
+        return [];
+      },
+      describe() {
+        throw new Error("Wrong-method requests must not reach descriptor generation");
+      },
+      configure() {},
+      reportFailure() {},
+    },
+  };
+  let port = 0;
+  const runtime = new FederationRuntime(cfg, connector, {
+    pollMs: 1000,
+    onListening(listening) {
+      port = listening;
+    },
+  });
+  t.after(() => runtime.stop());
+  await runtime.start();
+  for (let request = 0; request < 300; request++) {
+    assert.equal(
+      (await rawRuntimeRequest(port, federationDirectPathPrefix + federationNetworkingPath, "GET"))
+        .status,
+      405,
+    );
+  }
+  assert.equal(
+    (await rawRuntimeRequest(port, federationDirectPathPrefix + federationNetworkingPath, "GET"))
+      .status,
+    429,
+  );
+  const ping = Buffer.from(
+    JSON.stringify({ type: "unolock.grid.ping.v1", onionService: endpoint("b") }),
+  );
+  assert.equal((await rawRuntimeRequest(port, gridPath + "ping", "POST", ping)).status, 200);
+  for (let request = 0; request < 299; request++) {
+    assert.equal((await rawRuntimeRequest(port, federationNetworkingPath, "GET")).status, 405);
+  }
+  assert.equal((await rawRuntimeRequest(port, federationNetworkingPath, "GET")).status, 429);
 });
 
 test(

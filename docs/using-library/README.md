@@ -21,6 +21,8 @@ changing the destination onion service.
    lookup, publication and delivery stores through the same facade.
 6. [Privacy and application responsibilities](privacy.md): Tor, authority,
    diagnostics and durable application effects.
+7. [Direct Networking](direct-networking.md): optional HTTPS, mandatory Tor,
+   node capabilities, domain bootstrap and ingress configuration.
 
 The API is experimental. Check the public declarations and package version
 your application installs.

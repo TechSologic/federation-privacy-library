@@ -86,8 +86,10 @@ The built-in runtime uses a separately operated Tor process. Configure its
 onion service, local listener, SOCKS endpoint, and bootstrap peers. Both local
 sockets must be loopback addresses. Startup checks the SOCKS service and reports
 degraded readiness if it is unavailable; this check does not prove an onion
-descriptor is already reachable everywhere. No redirects or clearnet fallback
-are followed.
+descriptor is already reachable everywhere. Optional [Direct Networking](direct-networking.md)
+selects HTTPS only when both nodes enable it and the remote onion endpoint
+authenticates its current capability. Tor-only mode never opens direct sockets.
+Redirects are not followed.
 
 Supply one `storage` provider object. For the built-in runtime, implement its
 address/state/lease/commit capabilities. Conditional batches must be atomic
@@ -172,9 +174,11 @@ source or read receiver pauses the transfer. Reattach a read receiver by calling
 `read` with its original operation identifier. Instance recovery uses persisted
 transfer/source state; durability across process crashes depends on the adapters.
 
-Immutable first uploads larger than 8 MiB use multipart endpoints.
-Acknowledged parts and the upload identity are persisted. Mutable writes use the
-staged-object path followed by a separate signed version commit.
+Uploads larger than 8 MiB use multipart endpoints for both creation and
+replacement. Acknowledged parts and the upload identity are persisted. Parts
+remain invisible until completion atomically creates or replaces the whole
+object under the supplied revision condition. A separate signed-head commit can
+then authenticate metadata for the current object when required by policy.
 Uploads stream with backpressure. Computing the protocol-required MD5 and SHA-256
 values can reopen and scan the source; the library does not retain the whole
 archive in memory. MD5 is used only for wire-protocol compatibility; SHA-256
@@ -183,9 +187,28 @@ checks encrypted object integrity.
 An incoming multipart stream may have no whole-object digest until completion.
 The receiver stages bytes; the library then rereads staging and verifies length
 and digests before asking the store to commit. An unknown commit is preserved
-and inspected on retry. For mutable archives, committing bytes must not publish
-the head: the adapter publishes only through its atomic `commitVersion` method,
-checking both the predecessor and the referenced content's continued existence.
+and inspected on retry.
+
+Archive storage has S3-style whole-object semantics. `expectedRevision: null`
+means create only if no current object exists; any other value must exactly match
+the current revision/ETag. `commitStage` then atomically creates or replaces the
+one current complete object. Incomplete stages are invisible, but a successful
+commit is immediately returned by `stat` and `open`. The contract has no random,
+byte-range or partially visible mutation. An adapter may retain physical storage
+versions internally, but it must expose one current object and bound or reclaim
+superseded data.
+
+Signed heads are authenticated metadata for that already-current object; they
+do not publish the bytes. `commitVersion` must atomically compare both the exact
+current object snapshot (revision, encrypted length and SHA-256) and the signed
+head predecessor before publishing the successor. `versionState` must return the
+stored head and current object snapshot in one atomic read; assembling a head
+response from independent reads is forbidden. These rules prevent a replacement
+or deletion between validation and head publication. After a replacement and
+before its successor is committed, the prior head is retained only as internal
+predecessor state and is not returned as metadata for the new object. A first-use
+head read sees no current signed head; a caller with a prior freshness checkpoint
+fails closed until the successor is available.
 
 `handlers.authorization` resolves trusted public keys and bindings from the host's
 records. The library verifies Ed25519 request signatures, exact request hashes,
@@ -199,18 +222,16 @@ the client's private signing key. Encoding helpers are available through the roo
 Trusted bindings contain `spaceAccessRef` (or `spaceAuthorityId`) and
 `signingKeyId`; version commits also require `writerAccessId`,
 `spaceKeyEpochHash`, and `canWrite`. These names belong to the wire protocol,
-not application Space workflows. A trusted `mutable: true` binding selects the
-staged receipt for a mutable write.
+not application Space workflows.
 
-Operation context may supply wire values: `previousPointerHash` and
-`newEtag` for mutable writes, `createIntent` for creation, and `archiveListID` /
-`authorityArchiveID` for deletion. The v1 control proof does not
+Operation context may supply wire values: `createIntent` for creation and
+`archiveListID` / `authorityArchiveID` for deletion. The v1 control proof does not
 cover its outer collection selector, so the authorization resolver must return
 the trusted `archiveCollection`; the library compares it before calling storage.
 Stores must authenticate and scope cursors they issue; cursor strings are bounded
 to 4096 characters in requests and responses. Reads require trusted
 whole-object `expectedInfo`; a range also requires a digest for exactly that
-interval. Returned mutable heads are verified against an explicitly supplied
+interval. Returned signed heads are verified against an explicitly supplied
 trusted authority or one resolved by the local authorization handler before the
 library exposes them. Each `head` call also requires an application-held
 freshness checkpoint. Use `minimumSequence: 0` only for explicit first use. After
@@ -307,6 +328,9 @@ override the built-in runtime's SOCKS connector.
   snapshots. It never provides recipient authority.
 - `transport.lookup` and `transport.delivery` provide finite Tor I/O, reject
   redirects, and enforce response/custody bounds. They do not implement scheduling.
+  To enable direct mode, supply a Tor-only `transport.onion` connector and use
+  `network.connect` in every host transport, including archive paths; see the
+  [network integration contract](direct-networking.md#configuration-and-ownership).
 - `handlers.isAddressActive` supplies application address policy;
   `preparePublications` performs an eligibility sweep before publication.
 - `handlers.deliveryStatus` updates application state. It is not a transactional

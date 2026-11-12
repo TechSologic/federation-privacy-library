@@ -46,6 +46,7 @@ const documents = new Set([
   "docs/using-library/architecture.md",
   "docs/using-library/runtime.md",
   "docs/using-library/privacy.md",
+  "docs/using-library/direct-networking.md",
   "docs/using-library/api-example.ts",
   "examples/README.md",
   "examples/two-nodes.mjs",

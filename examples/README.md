@@ -268,8 +268,11 @@ streams the same bytes or requested interval on every attempt. Keep those bytes
 available for the transfer's lifetime and resolve the stable source ID after
 restart. Do not read a large archive into memory to create a message envelope.
 
-Uploads can return `staged` or `committed`. Mutable content needs a separate
-`commitVersion()` with a client-signed successor and expected predecessor.
+Uploads atomically create or replace a complete current object and return its
+revision. Large creations and replacements use multipart staging, whose parts
+remain invisible until completion. If the archive uses signed-head metadata,
+complete that separate step with `commitVersion()`, a client-signed successor
+and the expected predecessor.
 Downloads require trusted length/digest metadata and a receiver that stages
 bytes until verified completion. See [archive authorization and streaming](../docs/using-library/runtime.md#archive-streams-and-authorization)
 before implementing these providers. The local messaging demo does not exercise archives.

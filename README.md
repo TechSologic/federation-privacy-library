@@ -61,9 +61,10 @@ configuration and your application's durable providers.
   through the distributed hash table.
 - **Encrypted messaging.** Send application-encrypted messages and deliver
   incoming content to a registered asynchronous receiver.
-- **Streaming archives.** Transfer large encrypted archives with backpressure,
-  integrity verification, retries, cancellation, and recovery. Support archive
-  access and signed version commits where the protocol requires them.
+- **Streaming archives.** Transfer complete encrypted objects with backpressure,
+  integrity verification, conditional whole-object replacement, retries,
+  cancellation, and recovery. Signed version commits authenticate metadata for
+  the current object where the protocol requires them.
 - **One protocol across different hosts.** Use the same federation behavior in
   a standalone node, managed service, or third-party application, with
   application-supplied storage, data-access, and authorization implementations.
@@ -161,7 +162,11 @@ the application; the federation transports their encrypted data.
 
 ## Privacy And Independent Operation
 
-Federation traffic uses Tor onion services. Tor provides network-layer privacy;
+Federation traffic uses Tor onion services by default. Optional
+[Direct Networking](docs/using-library/direct-networking.md) uses HTTPS between
+opted-in peers while retaining mandatory Tor and shared federation membership.
+Direct networking reveals network metadata and domain/onion linkage.
+Tor provides network-layer privacy;
 it does not replace content encryption, recipient-key verification, or access
 control. Applications supply already-encrypted content, and peers remain
 untrusted. Traffic timing, sizes, and application behavior still matter to

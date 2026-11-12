@@ -16,9 +16,9 @@ import { HttpWire } from "../../src/transport.js";
 import { address, config, endpoint, eventually } from "../helpers.js";
 import { archivePolicy, TestArchives } from "../archive-adapter.js";
 
-async function pair(t: any, mutable = false) {
+async function pair(t: any) {
   const network = new TestNetwork();
-  const policy = archivePolicy(mutable);
+  const policy = archivePolicy();
   const store = new TestArchives();
   const a = network.createRuntime({
     ...config("i", ["j"]),
@@ -39,12 +39,16 @@ async function pair(t: any, mutable = false) {
   await b.addresses.register(target.record);
   return { a, b, target, store, policy, network, receiverStorage: receiverConfig.storage };
 }
-function source(data: Uint8Array, id = "syntheticarchive1"): ArchiveSource {
+function source(
+  data: Uint8Array,
+  id = "syntheticarchive1",
+  expectedRevision: string | null = null,
+): ArchiveSource {
   const memory = memorySource(data);
   return {
     ...memory,
     archive: { id, locator: gatewayLocator(id, endpoint("j")) },
-    expectedRevision: null,
+    expectedRevision,
     async describe() {
       return {
         byteLength: data.length,
@@ -128,8 +132,8 @@ test(
   },
 );
 test(
-  "multipart upload retries a persisted part and commits only once",
-  { timeout: 20000 },
+  "multipart upload retries parts and atomically replaces a whole object",
+  { timeout: 30000 },
   async (t) => {
     const { a, target, store } = await pair(t);
     let interrupted = false;
@@ -147,6 +151,37 @@ test(
     assert.equal(store.commits, 1);
     assert.equal(store.data.get(input.archive.id)?.info.sha256, (await input.describe()).sha256);
     assert.ok((await transfer.status()).attempt > 1);
+    assert.equal(result.status, "completed");
+    if (result.status !== "completed" || result.result.kind !== "archive-send")
+      throw new Error("Expected a completed archive upload");
+    const firstRevision = result.result.revision;
+
+    store.afterReceive = undefined;
+    const replacement = source(
+      new Uint8Array(9 * 1024 ** 2 + 7).fill(38),
+      input.archive.id,
+      firstRevision,
+    );
+    const replaced = await (
+      await a.archives.send(target.address, replacement)
+    ).wait({ signal: AbortSignal.timeout(15000) });
+    assert.equal(replaced.status, "completed", JSON.stringify(replaced));
+    assert.equal(store.commits, 2);
+    assert.equal(
+      store.data.get(input.archive.id)?.info.sha256,
+      (await replacement.describe()).sha256,
+    );
+
+    const stale = source(
+      new Uint8Array(9 * 1024 ** 2 + 7).fill(39),
+      input.archive.id,
+      firstRevision,
+    );
+    const rejected = await (
+      await a.archives.send(target.address, stale)
+    ).wait({ signal: AbortSignal.timeout(8000) });
+    assert.equal(rejected.status, "failed");
+    assert.equal(store.commits, 2);
   },
 );
 test("wrong authority fails closed before archive receiver runs", { timeout: 15000 }, async (t) => {
@@ -220,6 +255,7 @@ test("multipart session identity ignores unsigned peer locator variants", async 
       .update(new Uint8Array([1]))
       .digest("base64"),
     contentLength: 1,
+    expectedRevision: null,
   };
   const canonicalRequest = canonical(proofRequest);
   const [proof] = await policy.proofs.provide({
@@ -253,7 +289,7 @@ test(
   "signed version commits preserve predecessor and scope bindings",
   { timeout: 15000 },
   async (t) => {
-    const { a, target, policy, store, receiverStorage } = await pair(t, true);
+    const { a, target, policy, store, receiverStorage } = await pair(t);
     const input = source(new Uint8Array([1]));
     const archive = input.archive;
     const info: ArchiveInfo = {
@@ -270,12 +306,7 @@ test(
       }),
     );
     const upload = await (
-      await a.archives.send(target.address, input, undefined, {
-        context: document({
-          newEtag: '"synthetic-mutable-etag"',
-          previousPointerHash: "",
-        }),
-      })
+      await a.archives.send(target.address, input)
     ).wait({ signal: AbortSignal.timeout(8000) });
     assert.equal(upload.status, "completed", JSON.stringify(upload));
     assert.equal(
@@ -285,7 +316,20 @@ test(
           limit: 10,
         })
       ).items.length,
-      1,
+      0,
+      "a completed whole-object replacement must not create unreferenced content state",
+    );
+    const wrongInfo: ArchiveInfo = {
+      byteLength: 1,
+      sha256: createHash("sha256")
+        .update(new Uint8Array([9]))
+        .digest("base64url"),
+    };
+    await assert.rejects(
+      a.archives.commitVersion(target.address, archive, {
+        expectedPredecessor: null,
+        signedSuccessor: policy.pointer(archive.id, wrongInfo),
+      }),
     );
     const commit = await a.archives.commitVersion(target.address, archive, {
       expectedPredecessor: null,
@@ -305,7 +349,31 @@ test(
       freshness: { minimumSequence: 0 },
     });
     assert.equal(head?.hash, readDocument(signed).pointerHash);
-    const successor = policy.pointer(archive.id, info, readDocument(signed));
+    if (upload.status !== "completed" || upload.result.kind !== "archive-send")
+      throw new Error("Expected a completed archive upload");
+    const replacement = source(new Uint8Array([2]), archive.id, upload.result.revision);
+    const replacementInfo = await replacement.describe();
+    const replaced = await (
+      await a.archives.send(target.address, replacement)
+    ).wait({ signal: AbortSignal.timeout(8000) });
+    assert.equal(replaced.status, "completed", JSON.stringify(replaced));
+    assert.equal(
+      await a.archives.head(target.address, archive, {
+        freshness: { minimumSequence: 0 },
+      }),
+      null,
+      "a signed head for superseded bytes must not be exposed as current",
+    );
+    await assert.rejects(
+      a.archives.head(target.address, archive, {
+        freshness: {
+          minimumSequence: head!.sequence,
+          hashAtMinimum: head!.hash,
+        },
+      }),
+      /older than trusted local state/i,
+    );
+    const successor = policy.pointer(archive.id, replacementInfo, readDocument(signed));
     const updated = await a.archives.commitVersion(target.address, archive, {
       expectedPredecessor: head!.hash,
       signedSuccessor: successor,
@@ -345,6 +413,68 @@ test(
         signedSuccessor: document(tampered),
       }),
     );
+  },
+);
+
+test(
+  "signed head commit rejects a whole-object replacement racing after validation",
+  { timeout: 15000 },
+  async (t) => {
+    const { a, target, policy, store } = await pair(t);
+    const input = source(new Uint8Array([2]));
+    const info = await input.describe();
+    const first = policy.pointer(input.archive.id, info);
+    const upload = await (
+      await a.archives.send(target.address, input)
+    ).wait({ signal: AbortSignal.timeout(8000) });
+    assert.equal(upload.status, "completed", JSON.stringify(upload));
+    const committed = await a.archives.commitVersion(target.address, input.archive, {
+      expectedPredecessor: null,
+      signedSuccessor: first,
+    });
+    assert.equal(committed.outcome, "committed");
+    const successor = policy.pointer(input.archive.id, info, readDocument(first));
+    const original = store.commitVersion.bind(store);
+    store.commitVersion = async (...args) => {
+      store.data.get(input.archive.id)!.revision = '"raced-etag"';
+      return original(...args);
+    };
+    const raced = await a.archives.commitVersion(target.address, input.archive, {
+      expectedPredecessor: readDocument(first).pointerHash,
+      signedSuccessor: successor,
+    });
+    assert.equal(raced.outcome, "conflict");
+  },
+);
+
+test(
+  "an idempotent signed head retry rechecks the current whole object atomically",
+  { timeout: 15000 },
+  async (t) => {
+    const { a, target, policy, store } = await pair(t);
+    const input = source(new Uint8Array([3]));
+    const info = await input.describe();
+    const first = policy.pointer(input.archive.id, info);
+    const upload = await (
+      await a.archives.send(target.address, input)
+    ).wait({ signal: AbortSignal.timeout(8000) });
+    assert.equal(upload.status, "completed", JSON.stringify(upload));
+    const committed = await a.archives.commitVersion(target.address, input.archive, {
+      expectedPredecessor: null,
+      signedSuccessor: first,
+    });
+    assert.equal(committed.outcome, "committed");
+    const original = store.commitVersion.bind(store);
+    store.commitVersion = async (...args) => {
+      store.data.get(input.archive.id)!.revision = '"raced-idempotent-etag"';
+      return original(...args);
+    };
+    const retried = await a.archives.commitVersion(target.address, input.archive, {
+      expectedPredecessor: null,
+      signedSuccessor: first,
+    });
+    assert.equal(retried.outcome, "conflict");
+    assert.equal(retried.current?.hash, readDocument(first).pointerHash);
   },
 );
 

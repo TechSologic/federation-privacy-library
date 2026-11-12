@@ -128,8 +128,8 @@ export async function uploadEncryptedArchive(
   if (outcome.status !== "completed" || outcome.result.kind !== "archive-send") {
     throw new Error(`Archive upload ended with ${outcome.status}`);
   }
-  // A mutable upload may be staged: publish it separately with commitVersion()
-  // using a client-signed successor and the expected predecessor.
+  // The whole object is committed. If this archive uses signed-head metadata,
+  // bind that metadata to the exact current object with commitVersion().
   return outcome.result;
 }
 

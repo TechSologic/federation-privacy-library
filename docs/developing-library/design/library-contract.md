@@ -22,7 +22,7 @@ applications and their adapters.
 
 Applications construct one `Federation` through `createFederation`. Configuration
 contains grouped `storage`, `handlers`, `tor`, `transport`, `limits` and
-`scheduling` providers/settings. Internal services are composed by the facade;
+`scheduling` and optional `networking` providers/settings. Internal services are composed by the facade;
 applications do not construct coordinators or workers.
 
 Use TypeScript interfaces for replaceable behavior and ordinary values for
@@ -78,12 +78,17 @@ requested ranges. A source resolver supplies restart access by persisted source 
 Receivers stage encrypted intervals with backpressure, cancellation and lease
 fencing; partial or unverified content must remain invisible to readers.
 
-Staging, integrity verification, content commit, signed version publication and
-cleanup are separate operations. Preserve recoverable state when a commit outcome
-is unknown. Store operations must be idempotent where retries are allowed.
+Storage follows a whole-object model: null revision creates only when absent and
+an exact current revision conditionally replaces the complete object. A successful
+content commit immediately becomes the one current object; there are no random or
+partially visible writes. Preserve recoverable staging when a commit outcome is
+unknown, and bound or reclaim any provider-internal superseded versions.
 
-Mutable publication verifies client-signed successors, authority scope and the
-expected predecessor. The library never manufactures replacement client signatures.
+Signed version publication is a separate metadata operation. It verifies the
+client-signed successor, authority scope and expected predecessor, then atomically
+binds publication to the exact current object snapshot. It does not publish bytes.
+Providers return the stored head and current object snapshot in one atomic read;
+the library never manufactures replacement client signatures.
 Head reads require trusted authority and application-held freshness checkpoints;
 downloads require trusted object metadata and verified lengths/digests.
 
@@ -96,8 +101,14 @@ verification; a valid signature cannot bypass policy or quotas.
 
 Tor operates as a separate process. The library uses its SOCKS proxy and loopback
 forwarding; operators provision and maintain Tor and its onion identities. Host
-transport providers enforce bounded Tor I/O. No clearnet fallback or arbitrary
-redirects are permitted.
+transport providers enforce bounded I/O. Direct Networking is an explicit opt-in
+transport optimization within the same onion-identified federation. The library
+authenticates a short-lived HTTPS-origin delegation through the peer's onion
+service, validates HTTPS and public DNS destinations, and otherwise uses Tor.
+Tor-only policy never attempts direct DNS or sockets. Redirects are forbidden.
+Client-signed address records and permanent onion bindings remain unchanged.
+See [Direct Networking](../../using-library/direct-networking.md) for its public
+contract, privacy tradeoff, ingress boundary and verification limits.
 
 Use aggregate diagnostics. Do not add persistent relationship metadata for
 observability or log content, private keys, raw addresses, proofs or identifying

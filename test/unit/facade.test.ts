@@ -95,6 +95,57 @@ const unavailable = {
   },
 };
 
+test("retained domain seeds and configured onion seeds enter one lookup walk", async () => {
+  let requests = 0;
+  const store = lookup();
+  store.findValue = async () => undefined;
+  const federation = createFederation({
+    storage: {
+      lookup: store,
+      bootstrap: {
+        async get() {
+          return target.onionService;
+        },
+        async set() {
+          assert.fail("Tor-only discovery must not rewrite bootstrap bindings");
+        },
+      },
+    },
+    tor: {
+      onionService: `http://${"c".repeat(56)}.onion`,
+      bootstrap: [{ onionService: target.onionService }],
+    },
+    networking: { enabled: false, bootstrapOrigins: ["https://seed.federation.test"] },
+    transport: {
+      onion: {
+        async connect() {
+          assert.fail("No direct bootstrap or descriptor probe expected");
+        },
+      },
+      lookup: {
+        async postJson(onion, path) {
+          requests++;
+          assert.equal(onion, target.onionService);
+          assert.ok(path.endsWith("find-value"));
+          return {
+            type: "unolock.grid.findValue.response.v1",
+            addressHash: hash,
+            found: true,
+            lookupValue: Buffer.from(value.lookupValue).toString("base64url"),
+            storedAt: value.storedAt,
+          };
+        },
+      },
+    },
+  });
+  try {
+    assert.equal((await federation.addresses.resolve(hash)).source, "bootstrap");
+    assert.equal(requests, 1, "A domain and its onion counterpart are one peer");
+  } finally {
+    await federation.stop();
+  }
+});
+
 test("immediate submission pins before contact and ignores conflicting caller routes", async () => {
   const store = lookup();
   const queue = new TestDeliveryQueue();

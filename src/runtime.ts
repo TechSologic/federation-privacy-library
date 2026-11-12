@@ -37,6 +37,8 @@ import {
 import { encodeLookupValue } from "./protocol/lookupRecords.js";
 import { Archives, type ArchiveJob } from "./archives.js";
 import { archiveMaxBytes, archivePath, canonical } from "./protocol/archives.js";
+import type { FederationNetworking } from "./networking.js";
+import { federationNetworkingPath, federationNetworkingMaxBytes } from "./protocol/networking.js";
 
 interface Work {
   snapshot: C.TransferSnapshot;
@@ -109,13 +111,17 @@ export class FederationRuntime implements C.Federation {
   private leaseExpiresAt?: number;
   private windowAt = 0;
   private requestCount = 0;
+  private directRequestCount = 0;
   private listening = false;
+  private readonly network?: FederationNetworking;
+  private bootstrapRefreshAt = 0;
 
   constructor(
     readonly config: C.FederationConfiguration,
     connector: Connector,
     readonly hooks: RuntimeHooks = {},
   ) {
+    this.network = connector.network;
     onion(config.tor.onionService);
     this.limits = Object.freeze({ ...defaults, ...config.limits });
     for (const [name, value] of Object.entries(this.limits))
@@ -140,6 +146,7 @@ export class FederationRuntime implements C.Federation {
       config.tor.bootstrap,
       this.wire,
       this.state,
+      (signal) => this.network?.bootstrapPeers({ signal }) ?? Promise.resolve([]),
     );
     this.addresses = {
       register: (record, options) => this.saveAddress(record, null, options),
@@ -733,6 +740,11 @@ export class FederationRuntime implements C.Federation {
     }
   }
   private async maintain(signal: AbortSignal) {
+    if (Date.now() >= this.bootstrapRefreshAt) {
+      this.bootstrapRefreshAt = Date.now() + 60_000;
+      for (const peer of (await this.network?.bootstrapPeers({ signal })) ?? [])
+        this.discovery.offer(peer.onionService);
+    }
     for (const endpoint of [...this.discovery.candidates].slice(0, 4)) {
       this.discovery.candidates.delete(endpoint);
       try {
@@ -1094,8 +1106,22 @@ export class FederationRuntime implements C.Federation {
     if (Date.now() - this.windowAt >= 60_000) {
       this.windowAt = Date.now();
       this.requestCount = 0;
+      this.directRequestCount = 0;
     }
-    if (++this.requestCount > 600) return { status: 429, body: bytes({ type: "THROTTLED" }) };
+    if (
+      this.requestCount >= 600 ||
+      (request.ingress === "direct" && this.directRequestCount >= 300)
+    )
+      return { status: 429, body: bytes({ type: "THROTTLED" }) };
+    this.requestCount += 1;
+    if (request.ingress === "direct") this.directRequestCount += 1;
+    if (request.path === federationNetworkingPath && this.network) {
+      if (request.method !== "POST") return { status: 405 };
+      const raw = json(
+        await collect(request.body, federationNetworkingMaxBytes, { signal: request.signal }),
+      );
+      return { status: 200, body: bytes(this.network.describe(raw)) };
+    }
     if (request.path.startsWith(archivePath)) return await this.archives.handle(request);
     if (request.method !== "POST") return { status: 405 };
     if ([messagePath, legacyMessagePath].includes(request.path)) {

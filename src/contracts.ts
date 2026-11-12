@@ -248,10 +248,11 @@ export type TransferResult =
   | { readonly kind: "message"; readonly outcome: "delivered" }
   | {
       readonly kind: "archive-send";
-      readonly outcome: "staged" | "committed";
+      readonly outcome: "committed";
       readonly archive: ArchiveReference;
       readonly info: ArchiveInfo;
-      readonly receipt: ProtocolDocument;
+      /** Current revision returned by the successful whole-object commit. */
+      readonly revision: Revision;
     }
   | {
       readonly kind: "archive-read";
@@ -352,8 +353,18 @@ export type ArchiveList =
   | { readonly outcome: "deleted"; readonly deletedAt: number; readonly expiresAt: number };
 export interface ArchiveSource extends DataSource<ArchiveInfo> {
   readonly archive: ArchiveReference;
-  /** Null requires no existing committed object; otherwise compare the exact revision. */
+  /** S3-style condition: null requires no current object; otherwise match its exact revision. */
   readonly expectedRevision: Revision | null;
+}
+/** Exact current whole-object snapshot used for an atomic signed-head commit. */
+export interface ArchiveObjectSnapshot {
+  readonly revision: Revision;
+  readonly info: ArchiveInfo;
+}
+/** One atomic read of signed-head metadata and the current whole object. */
+export interface ArchiveVersionState {
+  readonly head: ArchiveVersion | null;
+  readonly content: ArchiveObjectSnapshot | null;
 }
 export interface ArchiveReceiveMetadata {
   readonly operationId: OperationId;
@@ -509,6 +520,7 @@ export interface ArchiveStore {
     archive: ArchiveReference,
     options: ArchiveStoreCall & { readonly range?: ByteRange },
   ): Promise<ByteStream>;
+  /** Atomically removes the current whole object, description, and signed head metadata. */
   remove(
     operationId: OperationId,
     archive: ArchiveReference,
@@ -538,8 +550,8 @@ export interface ArchiveStore {
     options: ArchiveStoreCall & { readonly range?: ByteRange },
   ): Promise<ByteStream>;
   /** Called only after complete encrypted length and integrity verification.
-   * For mutable archives this commits immutable content, not the visible head.
-   * stat/open continue to follow the accepted head until commitVersion succeeds.
+   * Atomically creates or replaces the one current whole object iff expectedRevision matches.
+   * Incomplete stages stay invisible; a successful commit is immediately visible to stat/open.
    */
   commitStage(
     stageId: string,
@@ -557,13 +569,18 @@ export interface ArchiveStore {
     fence: StorageFence,
     options: ArchiveStoreCall,
   ): Promise<"discarded" | "already-committed" | "pending">;
-  head(archive: ArchiveReference, options: ArchiveStoreCall): Promise<ArchiveVersion | null>;
-  /** Atomically check the predecessor and referenced stored content before publishing
-   * the verified version. Concurrent removal must not publish a dangling head. */
+  /** Atomically reads both fields; adapters must not assemble them across separate reads. */
+  versionState(archive: ArchiveReference, options: ArchiveStoreCall): Promise<ArchiveVersionState>;
+  /** Publish authenticated metadata for an already-current whole object.
+   * Atomically compare expectedContent and the predecessor before publishing. If the exact
+   * successor is already current, recheck expectedContent atomically before returning success.
+   * This method does not publish object bytes.
+   */
   commitVersion(
     operationId: OperationId,
     archive: ArchiveReference,
     expectedPredecessor: string | null,
+    expectedContent: ArchiveObjectSnapshot,
     verifiedSuccessor: ArchiveVersion,
     fence: StorageFence,
     options: ArchiveStoreCall,

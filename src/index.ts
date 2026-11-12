@@ -51,6 +51,8 @@ export type {
   ArchiveDescription,
   ArchiveList,
   ArchiveSource,
+  ArchiveObjectSnapshot,
+  ArchiveVersionState,
   ArchiveReceiveMetadata,
   ArchiveReceiver,
   ArchiveReadReceiver,

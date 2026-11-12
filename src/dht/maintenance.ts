@@ -4,7 +4,7 @@ import { dhtBucketIndex, dhtRefreshTarget, requireDhtId, type DhtContact } from 
 
 export interface DhtMaintenanceOptions {
   localId: string;
-  seeds(): Promise<DhtContact[]>;
+  seeds(signal?: AbortSignal): Promise<DhtContact[]>;
   closest(target: string): Promise<DhtContact[]>;
   oldest(limit: number): Promise<DhtContact[]>;
   candidates(): Promise<DhtContact[]>;
@@ -90,7 +90,7 @@ export class DhtMaintenance {
     // On a cold start choose one seed, not a ping before every discovery RPC.
     const seeds = oldest.length
       ? []
-      : (await this.options.seeds()).filter((peer) => peer.id !== this.options.localId);
+      : (await this.options.seeds(signal)).filter((peer) => peer.id !== this.options.localId);
     const seed = seeds.length ? [seeds[selection % seeds.length]] : [];
     const initial = new Map([...oldest, ...sampled, ...seed].map((peer) => [peer.id, peer]));
     const probes = [...initial.values()].filter((peer) => peer.id !== this.options.localId);
@@ -116,7 +116,10 @@ export class DhtMaintenance {
         this.cursor < 0
           ? this.options.localId
           : dhtRefreshTarget(this.options.localId, this.cursor, this.options.randomId());
-      const seeds = [...(await this.options.closest(target)), ...(await this.options.seeds())];
+      const seeds = [
+        ...(await this.options.closest(target)),
+        ...(await this.options.seeds(signal)),
+      ];
       const timeoutMs = Math.min(30_000, deadline - Date.now());
       if (timeoutMs <= 0) break;
       const result = await walkDht({

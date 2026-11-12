@@ -39,6 +39,9 @@ export class Discovery {
     readonly bootstrap: readonly { onionService: string }[],
     readonly wire: HttpWire,
     readonly state: State,
+    private readonly directBootstrapPeers?: (
+      signal: AbortSignal,
+    ) => Promise<{ onionService: string }[]>,
   ) {
     this.table = new DhtRoutingTable(nodeId(endpoint));
     if (bootstrap.length > 64) fail("limit-exceeded", "Too many bootstrap peers");
@@ -48,10 +51,11 @@ export class Discovery {
     onion(endpoint);
     if (endpoint !== this.endpoint && this.candidates.size < 128) this.candidates.add(endpoint);
   }
-  seeds(target: string): DhtContact[] {
+  async seeds(target: string, signal: AbortSignal): Promise<DhtContact[]> {
+    const direct = (await this.directBootstrapPeers?.(signal)) ?? [];
     return [
       ...this.table.closest(target, 20),
-      ...this.bootstrap.map((peer) => ({
+      ...[...this.bootstrap, ...direct].map((peer) => ({
         id: nodeId(peer.onionService),
         endpoint: peer.onionService,
       })),
@@ -166,7 +170,7 @@ export class Discovery {
     const result = await publishDhtValue({
       target: addressHash,
       localId: this.table.localId,
-      seeds: this.seeds(addressHash),
+      seeds: await this.seeds(addressHash, signal),
       signal,
       value: value.encoded,
       query: async (contact, target, bounded) => ({
@@ -199,12 +203,23 @@ export class Discovery {
   ): Promise<{ resolved: ResolvedAddress; record: LookupRecord } | null> {
     const hash = identity.addressHash;
     const pin = await this.state.get<Replica>("lookup-pin", hash);
-    let value = pin?.value ?? (await this.findLocal(hash));
+    let value = pin?.value;
+    if (!value) {
+      const local = await this.findLocal(hash);
+      if (local) {
+        try {
+          decodeLookup(local.encoded, hash, identity.validationFingerprint);
+          value = local;
+        } catch {
+          signal.throwIfAborted();
+        }
+      }
+    }
     if (!value) {
       const result = await walkDht<Replica>({
         target: hash,
         localId: this.table.localId,
-        seeds: this.seeds(hash),
+        seeds: await this.seeds(hash, signal),
         signal,
         query: async (contact, target, bounded) => {
           const r = object(
@@ -229,7 +244,14 @@ export class Discovery {
             validateLookupEnvelope(r.lookupValue, hash);
             if (r.storedAt > Date.now() + 60_000 || r.storedAt + replicaLeaseMs <= Date.now())
               fail("invalid-data", "Expired lookup response");
-            return { contacts: [], value: { encoded: r.lookupValue, storedAt: r.storedAt } };
+            const candidate = { encoded: r.lookupValue, storedAt: r.storedAt };
+            try {
+              decodeLookup(candidate.encoded, hash, identity.validationFingerprint);
+              return { contacts: [], value: candidate };
+            } catch {
+              bounded.throwIfAborted();
+              return { contacts: await this.peers(contact, target, bounded) };
+            }
           }
           return { contacts: await this.peers(contact, target, bounded) };
         },

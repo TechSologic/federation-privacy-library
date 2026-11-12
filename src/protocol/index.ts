@@ -20,6 +20,7 @@ export {
 export * from "./lookupRecords.js";
 export * from "./addressRoutes.js";
 export * from "./lookupRouting.js";
+export * from "./networking.js";
 export type {
   FederationLookupRpcHttpTransport,
   FederationReceiveAddressPublicKey,

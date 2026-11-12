@@ -45,7 +45,10 @@ npm pack --dry-run
 `npm test` runs unit tests and two-instance end-to-end tests through real local
 HTTP sockets. Test routing supplies synthetic onion-to-loopback mappings; it
 does not supply a shared DHT or message store. Production construction always
-uses Tor's SOCKS proxy and never falls back to direct networking.
+uses Tor's SOCKS proxy by default. Explicit Direct Networking tests add a local
+HTTPS proxy and validate certificate checks, mixed-mode participation and unchanged
+address bindings through the public factory. Test network mappings do not disable
+production public-address or TLS validation.
 
 For the separate live-network suite, install Tor or supply an executable:
 
