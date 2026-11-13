@@ -1,143 +1,85 @@
-# Direct Networking
+# Direct archive networking
 
-Direct Networking is an opt-in HTTPS transport within the existing federation.
-Tor, onion identities and onion bootstrap routes remain mandatory. Tor-only nodes
-retain full discovery, messaging and archive functionality. There is one DHT and
-placement policy; direct capability never changes identity or replica eligibility.
+Direct networking is an optional HTTPS transport for encrypted archive bytes,
+including large message attachments. DHT bootstrap, discovery, publication,
+Receive Address lookup, public-key lookup, messages and archive control requests
+always use Tor. There is no separate direct discovery or capability probe.
 
-## Configuration And Ownership
-
-Construct the public `createFederation` factory with optional configuration:
+## Configuration and ownership
 
 ```ts
-networking: {
-  enabled: true,
-  directOrigin: "https://node.example.com"
-}
+networking: { enabled: true, directOrigin: "https://node.example.com" }
 ```
 
-Omission defaults to Tor-only. Enabling requires an onion identity, a Tor
-connector, and an HTTPS domain origin without credentials, path, query or fragment.
-IP literals and local-use domains are rejected. Operators provision public DNS,
-TLS, ingress routing and Tor before advertising the endpoint.
+Enabling requires a Tor connector, an onion identity and a public HTTPS domain
+origin without credentials, path, query or fragment. IP literals, local domains,
+private DNS answers and mixed public/private answers are rejected. TLS verifies
+the configured hostname and platform trust roots. Redirects are never followed.
 
-The built-in runtime selects transport for discovery, public-key lookup, messages
-and archives automatically. Its Tor readiness probe remains active in both modes.
+The library learns the archive endpoint from the `x-unolock-archive-endpoint`
+header on existing successful Tor responses from that exact onion service.
+The receiving host advertises `network.archiveDirectOrigin` when enabled, or its
+onion URL when disabled. This is a server transport detail: clients, signed DHT
+records, archive metadata and authorization proofs remain unchanged. Existing
+Safes, Receive Addresses and saved archives continue working without migration.
 
-Host integrations supply `transport.onion.connect(onionService, signal)` as a
-Tor-only socket provider and use `federation.network.connect(onionService)` for
-lookup, messages and archives. The returned socket has completed its Tor
-connection or HTTPS certificate validation. Use the returned `origin` for the
-HTTP Host header and prepend `pathPrefix` to the unchanged protocol path.
-The provider detaches the connection signal before returning the socket; the
-HTTP owner controls request cancellation and streaming deadlines after handoff.
-Preserve bounded parsing, streaming, cancellation and admission. Supplying
-`networking` alone does not rewrite custom host transport providers.
+The built-in runtime handles these headers and transport selection automatically.
+Host HTTP adapters use the same public interface:
 
-## Capability And Bootstrap Protocol
+```ts
+// Discovery, messages and archive controls always use Tor.
+const control = await federation.network.connect(onionService, { signal });
+// After a successful response on that Tor connection only:
+federation.network.acceptTorArchiveEndpoint(onionService, responseHeader);
+// Encrypted archive bytes may use the learned HTTPS origin.
+const transfer = await federation.network.connectArchive(onionService, { signal });
+```
 
-The capability endpoint is a POST to
-`/.well-known/unolock-federation/v1/networking`. Requests contain
-`type: "unolock.federation.networking.request.v1"` and a fresh 32-byte base64url
-`challenge`. `network.describe(request)` produces a strict descriptor containing
-`type: "unolock.federation.networking.v1"`, the original `onionService`, `enabled`,
-the matching `challenge`, `expiresAt`, and `directOrigin` only when enabled.
+Only the adapter receiving a successful response through the authenticated Tor
+connection to that onion may call `acceptTorArchiveEndpoint`. Never learn an
+endpoint from a client, a DHT record, another peer's assertions or a direct HTTPS
+response. Missing, invalid or onion-valued headers clear the learned endpoint.
+The in-memory cache holds at most 512 peers for five minutes; it is cleared on
+policy changes and shutdown. Cold or expired entries use Tor immediately, without
+a discovery request. Their response can warm the cache for later archive parts.
 
-Before following an origin, the library fetches its descriptor through the exact
-authorized onion service. HTTPS alone does not authenticate an onion identity.
-The onion endpoint delegates transport to the declared HTTPS origin, whose
-certificate must match its domain and the platform's trusted roots. This adds
-Web PKI trust for the opted-in transport; a domain certificate is not an onion
-signature. Content encryption, proofs, replay protection and recipient
-verification remain required and unchanged.
+Use the socket, HTTP `origin` and `pathPrefix` returned by the library. Preserve
+request proof verification, streaming bounds and cancellation. The Tor provider
+must detach its setup signal before returning a socket; the HTTP owner controls
+request and streaming deadlines after handoff.
 
-Capabilities live at most five minutes in a bounded 512-entry memory cache,
-separate from permanent address pins. Old peers, absent capabilities, failed
-validation and unsuccessful discovery use Tor. Initial verification and later
-trust refresh still require Tor. Clocks must be synchronized for expiry checks.
+## Ingress and fallback
 
-`await federation.network.bootstrap("https://seed.example.com")` reads an HTTPS
-introduction and verifies its onion counterpart over Tor before returning an
-`{ onionService }` peer for the same discovery network.
+The public HTTPS proxy forwards `/federation-direct/` unchanged. The application
+admits only these method/path pairs while direct policy is enabled:
 
-For configured domain seeds, set `networking.bootstrapOrigins` (at most 16 HTTPS
-origins) and supply `storage.bootstrap` with durable encrypted `get(origin)` and
-`set(origin, onionService, { signal })` methods. Writes must honor cancellation
-and resolve only after durable storage. Retain configured mappings across
-restarts and policy changes, and prune origins removed from configuration.
-These introductions remain separate from permanent Receive Address pins.
+- `POST /federation/v1/archive/object/read`
+- `PUT /federation/v1/archive/object`
+- `PUT /federation/v1/archive/multipart/part`
+- `PUT /federation/v1/archive/relay/part`
 
-The facade resolves these seeds during ordinary discovery and merges the verified
-onion counterparts into the same graph. Concurrent resolutions share work;
-successful introductions refresh after five minutes and failures after 30 seconds.
-`network.bootstrapPeers()` exposes the same resolution for host-owned integration
-boundaries. A failed refresh uses the retained onion counterpart, never an
-unverified replacement. Tor-only mode reads retained counterparts without DNS or
-HTTPS. Explicit `bootstrap(origin)` also returns a retained counterpart in that
-mode, or fails if none exists. An unknown domain-only entry cannot supply a Tor
-fallback; configure an onion seed or verify the domain while direct mode is on.
-The library never silently adds public seeds to an explicit private/empty list.
+DHT, public keys, messages, archive lists, grants, multipart initialization and
+completion remain on onion listeners. Public proxies must block the unprefixed
+federation namespaces. Reserve inbound capacity for Tor requests and retain
+archive idle deadlines, byte limits and log redaction.
 
-## HTTPS Ingress Boundary
+DNS and TLS setup failures may fall back to Tor before any application bytes are
+written. Once a request has started, the operation's durable owner controls
+retries; the transport never replays an uncertain write. Direct failures have
+bounded backoff. Disabling direct aborts pending direct setup and closes open
+direct sockets. A remote withdrawal is learned on the next successful Tor response;
+a stale direct request can fail and its owner retries through Tor.
 
-Public HTTPS exposes only `/federation-direct/`, forwarding it without stripping
-the prefix to the library's loopback listener. The built-in listener checks
-current direct policy before removing the prefix and dispatching the original
-operation. It rejects this namespace when direct mode is disabled. The external
-capability path is
-`/federation-direct/.well-known/unolock-federation/v1/networking`.
+## Bootstrap
 
-The built-in listener retains its total limits of 16 active requests and 600
-accepted requests per minute. Direct ingress may use at most eight active slots
-and 300 requests in the same rate window, preserving Tor capacity without
-increasing total adapter load. External ingress should apply its own per-client
-limits before forwarding into this shared node boundary.
+Configure onion bootstrap peers. HTTPS bootstrap introductions, retained
+onion-to-domain hints and the node-wide networking descriptor protocol are removed.
+There is no capability refresh or direct discovery step.
 
-Tor forwards original unprefixed paths. Do not publish that raw listener or its
-unprefixed capability endpoint over HTTPS: this would bypass the direct ingress
-gate and could disclose an onion identity after disabling direct mode. Host
-integrations implement the same separation and gate, including discovery, and
-expose only federation endpoints. Keep admin endpoints outside this namespace.
-Do not log request bodies, address hashes or credentials.
+## Privacy
 
-Direct DNS checks every answer, rejecting private, loopback, link-local,
-reserved and transition destinations. TLS connects to a checked literal while
-retaining domain certificate verification and SNI, without resolving the hostname
-again. Redirects are never followed.
-
-## Fallback, Policy Changes And Privacy
-
-Both local policy and a fresh peer capability must enable direct mode. Failed
-direct connection preparation falls back to Tor before application bytes are
-sent. The selector returns a connection; it never sends or replays an application
-request. After an ambiguous write, its durable owner reconciles or retries the
-same operation identity and exact authorized bytes. Host transports call
-`network.reportFailure(onionService)` to prefer Tor temporarily on the next
-attempt. Integrity or authorization failures cannot become successful by changing
-transport.
-
-`network.configure({ enabled: false })` stops local direct selection, cancels
-pending direct work, clears capabilities and closes open direct sockets. The
-built-in direct ingress gate closes too. This cannot revoke delivered bytes,
-erase remote caches or remove domain/onion links already observed. Peers can
-retain stale capabilities until expiry and still attempt connections. Hosts
-persist operator policy and apply it at restart. Capabilities are relearned over
-Tor after a library restart.
-
-Enabling or changing an HTTPS origin never rewrites client-signed Receive Address
-records. Existing addresses and onion pins remain usable; old peers use Tor.
-Direct mode reveals network addresses and connection metadata and links the
-domain to the onion identity. This affects the whole hosting node, including
-Safes whose individual connections subsequently use Tor.
-
-## Verification Scope
-
-Tests exercise the public factory with separate local SOCKS and HTTPS proxies,
-real TLS and disposable test certificates, mixed peers, existing addresses and
-signed streaming archive operations. A test-only driver maps checked public
-destinations to loopback. Production validation has no private-address or
-certificate-check bypass. This is local protocol evidence, not real Tor
-interoperability, installed consumer qualification or deployed ingress proof.
-
-See [Architecture](architecture.md), [Privacy](privacy.md), and the
-[runtime contracts](runtime.md) for unchanged authority and storage rules.
+Direct archive connections reveal server network addresses, timing and sizes.
+The advertised endpoint links an HTTPS domain to an onion identity. Disabling
+direct cannot undo information already disclosed. TLS protects transport; client
+ciphertext, authenticated archive proofs and exact revision checks remain required.
+Tor identity and Tor discovery remain mandatory in both modes.

@@ -12,7 +12,6 @@ import {
   protocol,
   type Federation,
   type FederationNetworkConnection,
-  type FederationBootstrapStorage,
 } from "../../src/index.js";
 import { tlsFixture } from "../tls-fixture.js";
 
@@ -28,9 +27,6 @@ async function fixture(
     addresses?: string[];
     trustCertificate?: boolean;
     certificate?: ReturnType<typeof tlsFixture>;
-    alter?: (descriptor: unknown) => unknown;
-    bootstrapStorage?: FederationBootstrapStorage;
-    configuredBootstrap?: boolean;
   } = {},
 ) {
   const counters = { tor: 0, dns: 0, tls: 0, application: 0, descriptors: 0 };
@@ -46,11 +42,9 @@ async function fixture(
     const path = direct ? req.url!.slice(protocol.federationDirectPathPrefix.length) : req.url;
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
-    if (path === protocol.federationNetworkingPath) {
+    if (path === "/.well-known/unolock-federation/v1/networking") {
       counters.descriptors++;
-      const descriptor = peer.network.describe(JSON.parse(Buffer.concat(chunks).toString()));
-      res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify(options.alter ? options.alter(descriptor) : descriptor));
+      res.writeHead(404).end();
     } else {
       counters.application++;
       res.end(Buffer.concat(chunks));
@@ -94,15 +88,15 @@ async function fixture(
   const clients = new Set<Federation>();
   const makeClient = (enabled = options.localEnabled ?? true) => {
     const result = createFederation({
-      storage: { bootstrap: options.bootstrapStorage },
+      storage: {},
       tor: { onionService: local },
       transport: { onion: tor },
       networking: {
         enabled,
         directOrigin: "https://sender.federation.test",
-        bootstrapOrigins: options.configuredBootstrap ? [origin] : undefined,
       },
     });
+    if (options.remoteEnabled !== false) result.network.acceptTorArchiveEndpoint(remote, origin);
     clients.add(result);
     return result;
   };
@@ -140,7 +134,14 @@ async function fixture(
     t.mock.restoreAll();
     syncBuiltinESMExports();
   });
-  return { client, peer, origin, counters, directServer, makeClient };
+  return {
+    client,
+    peer,
+    origin,
+    counters,
+    directServer,
+    makeClient,
+  };
 }
 
 async function application(
@@ -156,8 +157,8 @@ async function application(
         {
           hostname: url.hostname,
           port: Number(url.port || 80),
-          path: connection.pathPrefix + "/federation/v1/message/receive",
-          method: "POST",
+          path: connection.pathPrefix + "/federation/v1/archive/object",
+          method: "PUT",
           agent,
           headers: { "content-length": bytes.length },
         },
@@ -205,154 +206,69 @@ test("direct policy requires Tor and validates public HTTPS origins", () => {
   );
 });
 
-test("Tor-only mode performs no direct discovery, DNS or TLS, including domain bootstrap", async (t) => {
+test("ordinary connections always use one Tor connection, with no capabilities, DNS or TLS", async (t) => {
+  const f = await fixture(t);
+  for (let i = 0; i < 2; i++) (await f.client.network.connect(remote)).socket.destroy();
+  assert.deepEqual(f.counters, { tor: 2, dns: 0, tls: 0, application: 0, descriptors: 0 });
+});
+
+test("archive bytes use the endpoint learned over Tor without a capability round trip", async (t) => {
+  const f = await fixture(t);
+  const bytes = Buffer.alloc(2 * 1024 * 1024, 0x61);
+  for (let i = 0; i < 2; i++) {
+    const c = await f.client.network.connectArchive(remote);
+    assert.equal(c.transport, "direct");
+    assert.deepEqual(await application(c, bytes), bytes);
+  }
+  assert.deepEqual(f.counters, { tor: 0, dns: 2, tls: 2, application: 2, descriptors: 0 });
+});
+
+test("cold and pre-direct peers use Tor without probing for capabilities", async (t) => {
+  const f = await fixture(t, { remoteEnabled: false });
+  (await f.client.network.connectArchive(remote)).socket.destroy();
+  f.client.network.acceptTorArchiveEndpoint(remote, undefined);
+  (await f.client.network.connectArchive(remote)).socket.destroy();
+  assert.deepEqual(f.counters, { tor: 2, dns: 0, tls: 0, application: 0, descriptors: 0 });
+});
+
+test("local Tor-only policy never performs direct DNS", async (t) => {
   const f = await fixture(t, { localEnabled: false });
-  const connection = await f.client.network.connect(remote);
-  assert.equal(connection.transport, "tor");
-  connection.socket.destroy();
-  await assert.rejects(f.client.network.bootstrap(f.origin), /requires direct networking/);
+  (await f.client.network.connectArchive(remote)).socket.destroy();
   assert.deepEqual(f.counters, { tor: 1, dns: 0, tls: 0, application: 0, descriptors: 0 });
 });
 
-test("an enabled node uses Tor when the peer disables direct mode", async (t) => {
-  const f = await fixture(t, { remoteEnabled: false });
-  const connection = await f.client.network.connect(remote);
-  assert.equal(connection.transport, "tor");
-  assert.equal(f.counters.dns, 0);
-  assert.equal(
-    f.counters.tor,
-    2,
-    "One authenticated capability query, then application connection",
-  );
-  connection.socket.destroy();
-});
-
-test("both enabled use verified HTTPS for unchanged application bytes and reuse the capability", async (t) => {
+test("invalid or withdrawn advertisements clear the endpoint and preserve Tor", async (t) => {
   const f = await fixture(t);
-  const payload = Buffer.from("synthetic encrypted bytes");
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const connection = await f.client.network.connect(remote);
-    assert.equal(connection.transport, "direct");
-    assert.equal(connection.origin, f.origin);
-    assert.deepEqual(await application(connection, payload), payload);
-  }
-  assert.deepEqual(f.counters, { tor: 1, dns: 2, tls: 2, application: 2, descriptors: 1 });
-});
-
-test("domain bootstrap verifies the same origin through the onion endpoint", async (t) => {
-  const f = await fixture(t);
-  assert.deepEqual(await f.client.network.bootstrap(f.origin), { onionService: remote });
-  assert.equal(f.counters.tor, 1);
-  assert.equal(f.counters.descriptors, 2);
-  assert.equal(f.counters.application, 0);
-});
-
-test("configured HTTPS seeds persist their verified onion counterpart across a Tor-only restart", async (t) => {
-  const retained = new Map<string, string>();
-  const f = await fixture(t, {
-    configuredBootstrap: true,
-    bootstrapStorage: {
-      async get(origin) {
-        return retained.get(origin);
-      },
-      async set(origin, onion, { signal }) {
-        signal.throwIfAborted();
-        retained.set(origin, onion);
-      },
-    },
-  });
-  const results = await Promise.all([
-    f.client.network.bootstrapPeers(),
-    f.client.network.bootstrapPeers(),
-  ]);
-  assert.deepEqual(results, [[{ onionService: remote }], [{ onionService: remote }]]);
-  assert.equal(retained.get(f.origin), remote);
-  assert.equal(f.counters.descriptors, 2, "Concurrent introductions share verification");
-  await f.client.stop();
-  const restarted = f.makeClient(false);
-  const before = { ...f.counters };
-  assert.deepEqual(await restarted.network.bootstrapPeers(), [{ onionService: remote }]);
-  assert.deepEqual(await restarted.network.bootstrap(f.origin), { onionService: remote });
-  assert.deepEqual(f.counters, before, "No DNS, TLS, or Tor I/O to read retained hints");
-  const connection = await restarted.network.connect(remote);
-  assert.equal(connection.transport, "tor");
-  connection.socket.destroy();
-  assert.equal(f.counters.dns, before.dns);
-  assert.equal(f.counters.tls, before.tls);
-});
-
-test("a failed domain introduction never persists a claimed onion identity", async (t) => {
-  let writes = 0;
-  const f = await fixture(t, {
-    configuredBootstrap: true,
-    alter: (descriptor) => ({
-      ...(descriptor as object),
-      directOrigin: "https://substituted.federation.test",
-    }),
-    bootstrapStorage: {
-      async get() {
-        return undefined;
-      },
-      async set() {
-        writes++;
-      },
-    },
-  });
-  assert.deepEqual(await f.client.network.bootstrapPeers(), []);
-  assert.equal(writes, 0);
-  const dns = f.counters.dns;
-  assert.deepEqual(await f.client.network.bootstrapPeers(), []);
-  assert.equal(f.counters.dns, dns, "Failed seeds have a bounded retry delay");
-});
-
-test("unknown domain seeds stay unresolved in Tor-only mode", async (t) => {
-  const f = await fixture(t, {
-    localEnabled: false,
-    configuredBootstrap: true,
-    bootstrapStorage: {
-      async get() {
-        return undefined;
-      },
-      async set() {
-        assert.fail("No write expected");
-      },
-    },
-  });
-  assert.deepEqual(await f.client.network.bootstrapPeers(), []);
-  assert.deepEqual(f.counters, { tor: 0, dns: 0, tls: 0, application: 0, descriptors: 0 });
-});
-
-test("malformed, substituted or expired capability is never followed directly", async (t) => {
-  const f = await fixture(t, {
-    alter: (descriptor) => ({ ...(descriptor as object), onionService: local }),
-  });
-  const connection = await f.client.network.connect(remote);
-  assert.equal(connection.transport, "tor");
-  assert.equal(f.counters.dns, 0);
-  connection.socket.destroy();
-  const challenge = "a".repeat(43);
-  const valid = {
-    type: "unolock.federation.networking.v1",
-    onionService: remote,
-    enabled: true,
-    directOrigin: f.origin,
-    challenge,
-    expiresAt: Date.now() + 60_000,
-  };
-  for (const changes of [
-    { extra: true },
-    { challenge: "b".repeat(43) },
-    { expiresAt: 1 },
-    { expiresAt: Date.now() + 60 * 60_000 },
-    { enabled: false },
+  for (const value of [
+    undefined,
+    remote,
+    "https://127.0.0.1",
+    "https://node.internal",
+    "http://peer.example.com",
+    [f.origin],
   ]) {
-    assert.throws(() =>
-      protocol.validateFederationNetworkingDescriptor(
-        { ...valid, ...changes },
-        { challenge, onionService: remote },
-      ),
-    );
+    f.client.network.acceptTorArchiveEndpoint(remote, f.origin);
+    f.client.network.acceptTorArchiveEndpoint(remote, value);
+    const c = await f.client.network.connectArchive(remote);
+    assert.equal(c.transport, "tor");
+    c.socket.destroy();
   }
+  assert.equal(f.counters.dns, 0);
+  assert.equal(f.counters.descriptors, 0);
+});
+
+test("endpoint learning is scoped to the exact onion and expires without a probe", async (t) => {
+  const f = await fixture(t, { remoteEnabled: false });
+  f.client.network.acceptTorArchiveEndpoint(local, f.origin);
+  (await f.client.network.connectArchive(remote)).socket.destroy();
+  assert.equal(f.counters.dns, 0);
+  f.client.network.acceptTorArchiveEndpoint(remote, f.origin);
+  const now = Date.now();
+  t.mock.method(Date, "now", () => now + 5 * 60_000 + 1);
+  const c = await f.client.network.connectArchive(remote);
+  assert.equal(c.transport, "tor");
+  assert.equal(f.counters.dns, 0);
+  c.socket.destroy();
 });
 
 test("all DNS answers must be public, including IPv6 and mixed answers", async (t) => {
@@ -371,70 +287,65 @@ test("all DNS answers must be public, including IPv6 and mixed answers", async (
   ]) {
     await t.test(addresses.join(","), async (t) => {
       const f = await fixture(t, { addresses });
-      const connection = await f.client.network.connect(remote);
-      assert.equal(connection.transport, "tor");
+      const c = await f.client.network.connectArchive(remote);
+      assert.equal(c.transport, "tor");
       assert.equal(f.counters.tls, 0);
-      connection.socket.destroy();
+      assert.equal(f.counters.descriptors, 0);
+      c.socket.destroy();
     });
   }
 });
 
-test("an untrusted TLS certificate falls back before any application write", async (t) => {
-  const f = await fixture(t, { trustCertificate: false });
-  const connection = await f.client.network.connect(remote);
-  assert.equal(connection.transport, "tor");
-  assert.equal(f.counters.application, 0);
-  assert.equal(f.counters.tls, 1);
-  connection.socket.destroy();
+test("TLS trust and hostname failures fall back before any application bytes", async (t) => {
+  for (const options of [
+    { trustCertificate: false },
+    { certificate: tlsFixture("other.federation.test") },
+  ]) {
+    await t.test(JSON.stringify(Object.keys(options)), async (t) => {
+      const f = await fixture(t, options);
+      const c = await f.client.network.connectArchive(remote);
+      assert.equal(c.transport, "tor");
+      assert.equal(f.counters.tls, 1);
+      assert.equal(f.counters.application, 0);
+      c.socket.destroy();
+    });
+  }
 });
 
-test("a trusted certificate for a different hostname cannot authenticate direct transport", async (t) => {
-  const f = await fixture(t, { certificate: tlsFixture("other.federation.test") });
-  const connection = await f.client.network.connect(remote);
-  assert.equal(connection.transport, "tor");
-  assert.equal(f.counters.application, 0);
-  assert.equal(f.counters.tls, 1);
-  connection.socket.destroy();
-});
-
-test("cancelled callers cannot accumulate unbounded unresolved system DNS work", async (t) => {
+test("cancelled callers retain DNS capacity until system lookups settle", async (t) => {
   const f = await fixture(t);
-  (await f.client.network.connect(remote)).socket.destroy();
   const resolvers: ((value: { address: string; family: number }[]) => void)[] = [];
   t.mock.method(dns, "lookup", () => new Promise((resolve) => resolvers.push(resolve)));
   syncBuiltinESMExports();
   const controllers = Array.from({ length: 32 }, () => new AbortController());
-  const attempts = controllers.map((controller) =>
-    f.client.network.connect(remote, { signal: controller.signal }),
+  const settled = Promise.allSettled(
+    controllers.map((controller) =>
+      f.client.network.connectArchive(remote, { signal: controller.signal }),
+    ),
   );
-  // Attach rejection handlers before cancellation to verify there is no unhandled rejection.
-  const settled = Promise.allSettled(attempts);
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(resolvers.length, 32);
-  for (const controller of controllers) controller.abort();
+  controllers.forEach((controller) => controller.abort());
   assert.ok((await settled).every((result) => result.status === "rejected"));
-  await assert.rejects(f.client.network.bootstrap(f.origin), /DNS capacity/);
+  const c = await f.client.network.connectArchive(remote);
+  assert.equal(c.transport, "tor");
+  c.socket.destroy();
   assert.equal(resolvers.length, 32);
-  for (const resolve of resolvers) resolve([{ address: "8.8.8.8", family: 4 }]);
+  resolvers.forEach((resolve) => resolve([{ address: "8.8.8.8", family: 4 }]));
 });
 
-test("disabling retires cached capabilities and closes open direct connections", async (t) => {
+test("disabling closes direct sockets and prevents subsequent DNS", async (t) => {
   const f = await fixture(t);
-  const first = await f.client.network.connect(remote);
-  assert.equal(first.transport, "direct");
+  const c = await f.client.network.connectArchive(remote);
+  assert.equal(c.transport, "direct");
   f.client.network.configure({ enabled: false });
-  assert.equal(first.socket.destroyed, true);
-  const dnsBefore = f.counters.dns;
-  const next = await f.client.network.connect(remote);
-  assert.equal(next.transport, "tor");
-  assert.equal(f.counters.dns, dnsBefore);
-  assert.equal(f.client.network.enabled, false);
-  next.socket.destroy();
+  assert.equal(c.socket.destroyed, true);
+  (await f.client.network.connectArchive(remote)).socket.destroy();
+  assert.equal(f.counters.dns, 1);
 });
 
-test("starting workers cannot detach policy cancellation from a pre-start connection", async (t) => {
+test("policy cancellation prevents a late direct connection", async (t) => {
   const f = await fixture(t);
-  (await f.client.network.connect(remote)).socket.destroy();
   let finish!: (value: { address: string; family: number }[]) => void;
   t.mock.method(
     dns,
@@ -445,53 +356,49 @@ test("starting workers cannot detach policy cancellation from a pre-start connec
       }),
   );
   syncBuiltinESMExports();
-  const pending = f.client.network.connect(remote);
+  const pending = f.client.network.connectArchive(remote);
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(typeof finish, "function");
   await f.client.start();
   f.client.network.configure({ enabled: false });
   finish([{ address: "8.8.8.8", family: 4 }]);
-  const connection = await pending;
-  assert.equal(connection.transport, "tor");
-  assert.equal(f.counters.tls, 1, "Disabling must prevent a late direct socket");
-  connection.socket.destroy();
+  const c = await pending;
+  assert.equal(c.transport, "tor");
+  assert.equal(f.counters.tls, 0);
+  c.socket.destroy();
 });
 
-test("uncertain application attempts are not replayed by the network selector", async (t) => {
+test("uncertain application writes are never replayed by connection selection", async (t) => {
   const f = await fixture(t);
-  const first = await f.client.network.connect(remote);
-  await application(first, Buffer.from("stable-operation-1"));
-  f.client.network.reportFailure(remote);
-  assert.equal(f.counters.application, 1);
-  const retry = await f.client.network.connect(remote);
-  assert.equal(retry.transport, "tor");
-  assert.equal(
-    f.counters.application,
-    1,
-    "Returning a socket must never resend an application operation",
+  await application(
+    await f.client.network.connectArchive(remote),
+    Buffer.from("stable-operation-1"),
   );
-  retry.socket.destroy();
+  f.client.network.reportFailure(remote);
+  const c = await f.client.network.connectArchive(remote);
+  assert.equal(c.transport, "tor");
+  assert.equal(f.counters.application, 1);
+  c.socket.destroy();
 });
 
-test("concurrent callers share capability discovery but keep independent connections", async (t) => {
+test("concurrent archive connections perform no capability discovery", async (t) => {
   const f = await fixture(t);
   const connections = await Promise.all(
-    Array.from({ length: 8 }, () => f.client.network.connect(remote)),
+    Array.from({ length: 8 }, () => f.client.network.connectArchive(remote)),
   );
-  assert.equal(f.counters.descriptors, 1);
-  assert.equal(f.counters.tor, 1);
-  for (const connection of connections) {
-    assert.equal(connection.transport, "direct");
-    connection.socket.destroy();
+  assert.equal(f.counters.tor, 0);
+  assert.equal(f.counters.descriptors, 0);
+  for (const c of connections) {
+    assert.equal(c.transport, "direct");
+    c.socket.destroy();
   }
 });
 
-test("caller cancellation and stopped facades cannot start networking", async (t) => {
+test("cancelled and stopped facades cannot start networking", async (t) => {
   const f = await fixture(t);
-  await assert.rejects(f.client.network.connect(remote, { signal: AbortSignal.abort() }));
-  assert.equal(f.counters.tor, 0);
+  await assert.rejects(f.client.network.connectArchive(remote, { signal: AbortSignal.abort() }));
   await f.client.stop();
   await assert.rejects(f.client.network.connect(remote));
-  await assert.rejects(f.client.network.bootstrap(f.origin));
-  assert.equal(f.counters.dns, 0);
+  await assert.rejects(f.client.network.connectArchive(remote));
+  assert.deepEqual(f.counters, { tor: 0, dns: 0, tls: 0, application: 0, descriptors: 0 });
 });

@@ -9,7 +9,7 @@ prove that a recipient received or read a message.
 
 Operate Tor separately. When providing a transport, enforce finite I/O budgets,
 permitted endpoints and response bounds. Direct HTTPS requires explicit opt-in
-and a current capability authenticated over onion; Tor-only mode never contacts
+and an endpoint learned from that peer over Tor; Tor-only mode never contacts
 direct endpoints. Do not follow redirects. Tor does not remove timing, size or
 application behavior signals.
 

@@ -151,7 +151,7 @@ test("a timed-out non-cooperative handler remains admission-counted", async (t) 
   );
 });
 
-test("direct requests cannot consume Tor request admission", async (t) => {
+test("direct requests cannot consume Tor request admission", { timeout: 5000 }, async (t) => {
   const settings = config("q").tor;
   const server = new HttpWire(
     {
@@ -167,7 +167,7 @@ test("direct requests cannot consume Tor request admission", async (t) => {
     release = resolve;
   });
   const port = await server.start(async (request) => {
-    if (request.path.startsWith("/synthetic-direct-hang-")) {
+    if (request.path === "/federation/v1/archive/object/read") {
       if (++entered === 8) release();
       await new Promise<void>((resolve) =>
         request.signal.addEventListener("abort", () => resolve(), { once: true }),
@@ -177,11 +177,14 @@ test("direct requests cannot consume Tor request admission", async (t) => {
     return { status: 200, body: Buffer.from('{"ok":true}') };
   });
   t.after(() => server.stop());
-  const pending = Array.from({ length: 8 }, (_, index) =>
-    rawRequest(port, `/federation-direct/synthetic-direct-hang-${index}`).catch(() => undefined),
+  const pending = Array.from({ length: 8 }, () =>
+    rawRequest(port, "/federation-direct/federation/v1/archive/object/read").catch(() => undefined),
   );
   await allEntered;
-  const excessDirect = await rawRequest(port, "/federation-direct/synthetic-direct-excess");
+  const excessDirect = await rawRequest(
+    port,
+    "/federation-direct/federation/v1/archive/object/read",
+  );
   assert.equal(excessDirect.status, 503);
   assert.deepEqual(JSON.parse(excessDirect.body.toString()), { type: "THROTTLED" });
   const tor = await rawRequest(port, "/synthetic-tor-control");

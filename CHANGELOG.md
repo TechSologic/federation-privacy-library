@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.0-beta.4
+
+- Keep DHT discovery, address/key lookup, messages and archive controls on Tor;
+  remove capability probes and HTTPS bootstrap introductions.
+- Learn archive HTTPS endpoints from existing successful Tor responses; keep
+  clients, signed addresses and saved archive metadata unchanged.
+- Restrict HTTPS to archive bytes, with guarded DNS/TLS, Tor fallback before
+  writes, cancellation and existing proof checks. Cold peers use Tor without probes.
+
 ## 0.1.0-beta.3
 
 - Add opt-in Direct Networking through the public factory: onion-authenticated

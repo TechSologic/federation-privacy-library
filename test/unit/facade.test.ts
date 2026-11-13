@@ -95,27 +95,19 @@ const unavailable = {
   },
 };
 
-test("retained domain seeds and configured onion seeds enter one lookup walk", async () => {
+test("configured onion seeds enter one lookup walk", async () => {
   let requests = 0;
   const store = lookup();
   store.findValue = async () => undefined;
   const federation = createFederation({
     storage: {
       lookup: store,
-      bootstrap: {
-        async get() {
-          return target.onionService;
-        },
-        async set() {
-          assert.fail("Tor-only discovery must not rewrite bootstrap bindings");
-        },
-      },
     },
     tor: {
       onionService: `http://${"c".repeat(56)}.onion`,
       bootstrap: [{ onionService: target.onionService }],
     },
-    networking: { enabled: false, bootstrapOrigins: ["https://seed.federation.test"] },
+    networking: { enabled: false },
     transport: {
       onion: {
         async connect() {
@@ -140,7 +132,7 @@ test("retained domain seeds and configured onion seeds enter one lookup walk", a
   });
   try {
     assert.equal((await federation.addresses.resolve(hash)).source, "bootstrap");
-    assert.equal(requests, 1, "A domain and its onion counterpart are one peer");
+    assert.equal(requests, 1, "One configured onion requires one lookup");
   } finally {
     await federation.stop();
   }

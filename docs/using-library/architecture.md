@@ -56,10 +56,10 @@ The library does not install or launch Tor, create onion identities, or manage
 Tor configuration. Application transport providers serve the host queue path;
 they do not replace the built-in runtime's SOCKS connector.
 
-[Direct Networking](direct-networking.md) adds shared endpoint discovery and
-connection selection through the facade's `network` service. The built-in runtime
-uses it automatically; host transports call it for their own I/O. Its HTTPS
-capabilities are separate from signed address records, and Tor remains mandatory.
+[Direct Networking](direct-networking.md) selects HTTPS only for archive bytes.
+The library learns endpoints from existing Tor responses; clients and signed
+address records remain unchanged. DHT, address/key lookup, messages and archive
+controls always use Tor; no capability probe occurs.
 
 ## Public Entry Points
 

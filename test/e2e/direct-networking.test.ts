@@ -12,12 +12,11 @@ import { publicNetwork } from "../public-network.js";
 import { archivePolicy, TestArchives } from "../archive-adapter.js";
 
 test(
-  "domain-only bootstrap joins the shared graph and works after a Tor-only restart",
+  "configured onion seeds join through Tor with direct archive policy",
   { timeout: 30_000 },
   async (t) => {
     const network = await publicNetwork(t, ["a", "b"]);
     const hosts = new Map(["a", "b"].map((letter) => [letter, config(letter)]));
-    const retained = new Map<string, string>();
     const received: Buffer[] = [];
     const peers: Federation[] = [];
     t.after(async () => {
@@ -30,21 +29,15 @@ test(
         storage: {
           ...host.storage,
           commit: host.storage.commit.bind(host.storage),
-          bootstrap: {
-            async get(origin) {
-              return retained.get(origin);
-            },
-            async set(origin, onion, { signal }) {
-              signal.throwIfAborted();
-              retained.set(origin, onion);
-            },
-          },
         },
-        tor: { ...network.configs.get(letter)!.tor, bootstrap: [] },
+        tor: {
+          ...network.configs.get(letter)!.tor,
+          bootstrap:
+            letter === "a" ? [{ onionService: network.configs.get("b")!.tor.onionService }] : [],
+        },
         networking: {
           enabled,
           directOrigin: network.configs.get(letter)!.directOrigin,
-          bootstrapOrigins: letter === "a" ? [network.configs.get("b")!.directOrigin] : [],
         },
         handlers: {
           authorization: host.authorization,
@@ -77,15 +70,9 @@ test(
         "completed",
       );
     };
-    await send("domain-bootstrap-direct", 81);
-    assert.equal(
-      retained.get(network.configs.get("b")!.directOrigin),
-      network.configs.get("b")!.tor.onionService,
-    );
+    await send("onion-bootstrap-direct-policy", 81);
     assert.ok(
-      network.requests.some(
-        (req) => req.transport === "direct" && req.path === protocol.messagePath,
-      ),
+      network.requests.some((req) => req.transport === "tor" && req.path === protocol.messagePath),
     );
     await a.stop();
     a = make("a", false);
@@ -109,7 +96,7 @@ test(
 );
 
 test(
-  "lost HTTPS custody acknowledgement retries through Tor with one receiver effect",
+  "direct policy keeps message delivery on Tor with one receiver effect",
   { timeout: 30_000 },
   async (t) => {
     const network = await publicNetwork(t, ["a", "b"], { dropMessageAcknowledgementOnce: true });
@@ -157,7 +144,7 @@ test(
     const attempts = network.requests.filter((req) => req.path === protocol.messagePath);
     assert.deepEqual(
       attempts.map((req) => req.transport),
-      ["direct", "tor"],
+      ["tor"],
     );
     assert.equal(
       (
@@ -243,8 +230,8 @@ test(
       expectedBytes.map((bytes) => bytes.toString("hex")).sort(),
     );
     const messagePaths = network.requests.filter((req) => req.path === protocol.messagePath);
-    assert.equal(messagePaths.filter((req) => req.transport === "direct").length, 1);
-    assert.equal(messagePaths.filter((req) => req.transport === "tor").length, 2);
+    assert.equal(messagePaths.filter((req) => req.transport === "direct").length, 0);
+    assert.equal(messagePaths.filter((req) => req.transport === "tor").length, 3);
     const torRecipient = await address();
     await peers.get("c")!.addresses.register(torRecipient.record);
     const returnTransfer = await peers
@@ -269,14 +256,6 @@ test(
     assert.ok(
       !network.requests.some((req) => req.host.startsWith("c") && req.transport === "direct"),
     );
-    assert.deepEqual(
-      await peers.get("a")!.network.bootstrap(network.configs.get("b")!.directOrigin),
-      { onionService: network.configs.get("b")!.tor.onionService },
-    );
-    await assert.rejects(
-      peers.get("c")!.network.bootstrap(network.configs.get("b")!.directOrigin),
-      /requires direct networking/,
-    );
 
     peers.get("a")!.network.configure({ enabled: false });
     await send("a", "direct-disabled-again");
@@ -286,7 +265,7 @@ test(
       network.requests.filter(
         (req) => req.transport === "direct" && req.path === protocol.messagePath,
       ).length,
-      1,
+      0,
     );
   },
 );
@@ -329,7 +308,7 @@ test(
     await Promise.all([a.start(), b.start()]);
     const target = await address();
     await b.addresses.register(target.record);
-    const data = Buffer.alloc(2 * 1024 * 1024 + 37, 21);
+    const data = Buffer.alloc(9 * 1024 * 1024 + 37, 21);
     const info = {
       byteLength: data.length,
       sha256: createHash("sha256").update(data).digest("base64url"),
@@ -391,10 +370,22 @@ test(
     const archivePaths = network.requests.filter((req) =>
       req.path.startsWith("/federation/v1/archive/"),
     );
-    assert.deepEqual(
-      archivePaths.map((req) => req.path),
-      ["/federation/v1/archive/object", "/federation/v1/archive/object/read"],
+    const bytePaths = new Set([
+      "/federation/v1/archive/object",
+      "/federation/v1/archive/object/read",
+      "/federation/v1/archive/multipart/part",
+    ]);
+    assert.ok(archivePaths.some((req) => req.path.endsWith("multipart/part")));
+    assert.ok(archivePaths.some((req) => req.path.endsWith("multipart/init")));
+    for (const req of archivePaths)
+      assert.equal(req.transport, bytePaths.has(req.path) ? "direct" : "tor");
+    assert.ok(
+      network.requests
+        .filter((req) => !bytePaths.has(req.path))
+        .every((req) => req.transport === "tor"),
     );
-    assert.ok(archivePaths.every((req) => req.transport === "direct"));
+    assert.ok(
+      !network.requests.some((req) => req.path === "/.well-known/unolock-federation/v1/networking"),
+    );
   },
 );

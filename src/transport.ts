@@ -16,7 +16,11 @@ import { collect } from "./streams.js";
 import { fail, FederationError, integer } from "./errors.js";
 import { lookupRequestMaxBytes } from "./protocol/lookup.js";
 import type { FederationNetworking } from "./networking.js";
-import { federationDirectPathPrefix } from "./protocol/networking.js";
+import {
+  federationDirectPathPrefix,
+  federationArchiveEndpointHeader,
+  isFederationArchiveDataRequest,
+} from "./protocol/networking.js";
 
 export interface WireRequest {
   method?: "GET" | "POST" | "PUT";
@@ -161,6 +165,8 @@ export class HttpWire {
       if (path.startsWith(federationDirectPathPrefix + "/")) {
         if (!this.connector.network?.enabled) fail("unauthorized", "Direct networking is disabled");
         path = path.slice(federationDirectPathPrefix.length);
+        if (!isFederationArchiveDataRequest(req.method ?? "", path))
+          fail("unauthorized", "Direct ingress is restricted to archive bytes");
       }
       const body = Readable.toWeb(req) as ByteStream;
       operation = handler({ ingress, path, method: req.method ?? "", headers, body, signal });
@@ -169,6 +175,12 @@ export class HttpWire {
         "content-type": "application/json",
         "cache-control": "no-store",
         ...result.headers,
+        ...(ingress === "tor" && this.connector.network
+          ? {
+              [federationArchiveEndpointHeader]:
+                this.connector.network.archiveDirectOrigin ?? this.config.onionService,
+            }
+          : {}),
       });
       if (!result.body || result.body instanceof Uint8Array) {
         res.end(result.body);
@@ -260,7 +272,9 @@ export class HttpWire {
     let socket: Socket | undefined;
     try {
       if (this.connector.network) {
-        const connection = await this.connector.network.connect(endpoint, { signal });
+        const connection = isFederationArchiveDataRequest(input.method ?? "POST", input.path)
+          ? await this.connector.network.connectArchive(endpoint, { signal })
+          : await this.connector.network.connect(endpoint, { signal });
         socket = connection.socket;
         url = new URL(connection.origin);
         pathPrefix = connection.pathPrefix;
@@ -297,6 +311,11 @@ export class HttpWire {
           const returned: Record<string, string> = {};
           for (const [key, value] of Object.entries(response.headers))
             if (typeof value === "string") returned[key] = value;
+          if (!direct && (response.statusCode ?? 503) >= 200 && (response.statusCode ?? 503) < 300)
+            this.connector.network?.acceptTorArchiveEndpoint(
+              endpoint,
+              returned[federationArchiveEndpointHeader],
+            );
           response.once("close", () => {
             agent.destroy();
             this.agents.delete(agent);

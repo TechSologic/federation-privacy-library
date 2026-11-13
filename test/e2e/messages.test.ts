@@ -6,10 +6,7 @@ import { TestNetwork } from "../../src/testing/index.js";
 import { collect } from "../../src/streams.js";
 import { encodeMessage, messagePath } from "../../src/protocol/messages.js";
 import { gridPath } from "../../src/protocol/lookup.js";
-import {
-  federationDirectPathPrefix,
-  federationNetworkingPath,
-} from "../../src/protocol/networking.js";
+import { federationDirectPathPrefix } from "../../src/protocol/networking.js";
 import { FederationRuntime } from "../../src/runtime.js";
 import { HttpWire, type Connector } from "../../src/transport.js";
 import type { ByteStream } from "../../src/contracts.js";
@@ -206,17 +203,13 @@ test("direct request-rate exhaustion does not throttle Tor", { timeout: 15000 },
     ...base,
     network: {
       enabled: true,
+      archiveDirectOrigin: "https://peer.example.com",
+      acceptTorArchiveEndpoint() {},
+      async connectArchive() {
+        throw new Error("Unexpected archive connection");
+      },
       async connect() {
         throw new Error("Outbound networking is not used");
-      },
-      async bootstrap() {
-        throw new Error("Bootstrap is not used");
-      },
-      async bootstrapPeers() {
-        return [];
-      },
-      describe() {
-        throw new Error("Wrong-method requests must not reach descriptor generation");
       },
       configure() {},
       reportFailure() {},
@@ -233,14 +226,24 @@ test("direct request-rate exhaustion does not throttle Tor", { timeout: 15000 },
   await runtime.start();
   for (let request = 0; request < 300; request++) {
     assert.equal(
-      (await rawRuntimeRequest(port, federationDirectPathPrefix + federationNetworkingPath, "GET"))
-        .status,
-      405,
+      (
+        await rawRuntimeRequest(
+          port,
+          federationDirectPathPrefix + "/federation/v1/archive/object/read",
+          "POST",
+        )
+      ).status,
+      404,
     );
   }
   assert.equal(
-    (await rawRuntimeRequest(port, federationDirectPathPrefix + federationNetworkingPath, "GET"))
-      .status,
+    (
+      await rawRuntimeRequest(
+        port,
+        federationDirectPathPrefix + "/federation/v1/archive/object/read",
+        "POST",
+      )
+    ).status,
     429,
   );
   const ping = Buffer.from(
@@ -248,9 +251,9 @@ test("direct request-rate exhaustion does not throttle Tor", { timeout: 15000 },
   );
   assert.equal((await rawRuntimeRequest(port, gridPath + "ping", "POST", ping)).status, 200);
   for (let request = 0; request < 299; request++) {
-    assert.equal((await rawRuntimeRequest(port, federationNetworkingPath, "GET")).status, 405);
+    assert.equal((await rawRuntimeRequest(port, gridPath + "find-value", "GET")).status, 405);
   }
-  assert.equal((await rawRuntimeRequest(port, federationNetworkingPath, "GET")).status, 429);
+  assert.equal((await rawRuntimeRequest(port, gridPath + "find-value", "GET")).status, 429);
 });
 
 test(

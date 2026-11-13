@@ -102,9 +102,10 @@ verification; a valid signature cannot bypass policy or quotas.
 Tor operates as a separate process. The library uses its SOCKS proxy and loopback
 forwarding; operators provision and maintain Tor and its onion identities. Host
 transport providers enforce bounded I/O. Direct Networking is an explicit opt-in
-transport optimization within the same onion-identified federation. The library
-authenticates a short-lived HTTPS-origin delegation through the peer's onion
-service, validates HTTPS and public DNS destinations, and otherwise uses Tor.
+transport optimization for archive bytes within the same onion-identified
+federation. The library learns a short-lived HTTPS origin from existing successful
+Tor responses from that exact peer, validates HTTPS and public DNS destinations,
+and otherwise uses Tor. Lookup, messages and archive controls always use Tor.
 Tor-only policy never attempts direct DNS or sockets. Redirects are forbidden.
 Client-signed address records and permanent onion bindings remain unchanged.
 See [Direct Networking](../../using-library/direct-networking.md) for its public

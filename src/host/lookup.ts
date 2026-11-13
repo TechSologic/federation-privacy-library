@@ -23,7 +23,6 @@ export interface FederationLookupCoordinatorOptions {
   rpcClient: Pick<FederationLookupRpcClient, "findValue" | "findNode" | "putValue"> &
     Partial<Pick<FederationLookupRpcClient, "ping">>;
   bootstrapPeers: FederationLookupPeer[];
-  directBootstrapPeers?(signal?: AbortSignal): Promise<FederationLookupPeer[]>;
   localOnionService?: string;
   publishQueue?: PublicationStorage | ClaimedPublicationStorage;
   maxPublishPeers?: number;
@@ -50,7 +49,6 @@ export class FederationLookupCoordinator {
   private readonly rpcClient: FederationLookupCoordinatorOptions["rpcClient"];
   private readonly localOnionService?: string;
   private readonly bootstrapPeers: FederationLookupPeer[];
-  private readonly directBootstrapPeers?: FederationLookupCoordinatorOptions["directBootstrapPeers"];
   private readonly publishQueue?: PublicationStorage | ClaimedPublicationStorage;
   private readonly maxPublishPeers: number;
   private readonly maxRetryBatch: number;
@@ -69,7 +67,6 @@ export class FederationLookupCoordinator {
       : undefined;
     if (this.localOnionService) this.localLookup.configureRouting(this.localOnionService);
     this.bootstrapPeers = options.bootstrapPeers.map(validatePeer);
-    this.directBootstrapPeers = options.directBootstrapPeers;
     this.publishQueue = options.publishQueue;
     this.isAddressActive = options.isAddressActive;
     this.maxPublishPeers = normalizeLimit(options.maxPublishPeers ?? 8, "maxPublishPeers");
@@ -110,8 +107,7 @@ export class FederationLookupCoordinator {
     const onion = this.localLookup.findBootstrapPeers
       ? (await this.localLookup.findBootstrapPeers()).map(validatePeer)
       : this.bootstrapPeers;
-    const direct = (await this.directBootstrapPeers?.(signal)) ?? [];
-    return [...new Map([...onion, ...direct].map((peer) => [peer.onionService, peer])).values()];
+    return [...new Map(onion.map((peer) => [peer.onionService, peer])).values()];
   }
 
   get joined(): boolean {

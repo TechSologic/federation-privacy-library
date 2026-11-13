@@ -1,35 +1,17 @@
-import { randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
-import { Agent, request } from "node:http";
 import { BlockList, isIP, type Socket } from "node:net";
 import { connect as tlsConnect } from "node:tls";
 import { FederationError, fail } from "./errors.js";
 import { validateFederationOnionService } from "./protocol/lookupRecords.js";
 import {
   federationDirectPathPrefix,
-  federationNetworkingChallenge,
-  federationNetworkingLeaseMs,
-  federationNetworkingMaxBytes,
-  federationNetworkingPath,
   normalizeFederationDirectOrigin,
-  validateFederationNetworkingDescriptor,
-  type FederationNetworkingDescriptor,
 } from "./protocol/networking.js";
 
 /** Operator policy. Tor and its stable identity remain mandatory in both modes. */
 export interface FederationNetworkingConfiguration {
   readonly enabled: boolean;
   readonly directOrigin?: string;
-  /** HTTPS introductions, resolved into the same onion discovery graph. Maximum 16. */
-  readonly bootstrapOrigins?: readonly string[];
-}
-
-/** Encrypted durable introductions, separate from permanent Receive Address pins.
- * Retain configured origins across restarts and policy changes; prune removed
- * configuration entries. set resolves only after durable storage. */
-export interface FederationBootstrapStorage {
-  get(origin: string): Promise<string | undefined>;
-  set(origin: string, onionService: string, options: { signal: AbortSignal }): Promise<void>;
 }
 
 /** Host provider must connect only through Tor; the facade owns transport selection.
@@ -49,17 +31,21 @@ export interface FederationNetworkConnection {
 
 export interface FederationNetworking {
   readonly enabled: boolean;
+  readonly archiveDirectOrigin: string | undefined;
+  /** Always Tor: discovery, public keys, messaging and archive controls. */
   connect(
     onionService: string,
     options?: { signal?: AbortSignal },
   ): Promise<FederationNetworkConnection>;
-  /** HTTPS bootstrap is only an introduction until its onion binding is checked over Tor. */
-  bootstrap(origin: string, options?: { signal?: AbortSignal }): Promise<{ onionService: string }>;
-  /** Configured domain seeds, with retained onion fallback and bounded refresh.
-   * Tor-only mode reads storage without DNS or HTTPS. */
-  bootstrapPeers(options?: { signal?: AbortSignal }): Promise<{ onionService: string }[]>;
-  /** Serve only over the onion listener or explicitly enabled direct ingress. */
-  describe(request: unknown): FederationNetworkingDescriptor;
+  /** Archive bytes only; cold or expired endpoints use Tor without a discovery probe. */
+  connectArchive(
+    onionService: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<FederationNetworkConnection>;
+  /** Host adapters call this only for successful responses received through the
+   * authenticated Tor connection to this exact onion service, never from clients,
+   * DHT record contents, direct responses, or another peer's assertions. */
+  acceptTorArchiveEndpoint(onionService: string, value: unknown): void;
   /** Withdraw direct policy immediately, including pending attempts and open direct sockets. */
   configure(policy: FederationNetworkingConfiguration): void;
   /** An uncertain application attempt is retried by its durable owner, never by this selector. */
@@ -122,15 +108,14 @@ export class FederationNetwork implements FederationNetworking {
   private generation = new AbortController();
   private readonly sockets = new Set<Socket>();
   private readonly active = new Set<AbortController>();
-  private readonly cache = new Map<
-    string,
-    { descriptor?: FederationNetworkingDescriptor; until: number }
-  >();
-  private readonly pending = new Map<string, Promise<FederationNetworkingDescriptor | undefined>>();
+  private readonly failures = new Map<string, number>();
+  private readonly archiveEndpoints = new Map<string, { origin: string; until: number }>();
   private closed = false;
   private dnsInFlight = 0;
-  private readonly bootstrapRefresh = new Map<string, number>();
-  private readonly bootstrapPending = new Map<string, Promise<{ onionService: string }>>();
+
+  get archiveDirectOrigin(): string | undefined {
+    return this.enabled ? this.policy.directOrigin : undefined;
+  }
 
   get enabled(): boolean {
     return !this.closed && this.policy.enabled;
@@ -140,7 +125,6 @@ export class FederationNetwork implements FederationNetworking {
     private readonly onionService: string | undefined,
     private readonly tor: FederationOnionConnector | undefined,
     policy: FederationNetworkingConfiguration = { enabled: false },
-    private readonly bootstrapStorage?: FederationBootstrapStorage,
   ) {
     this.policy = this.validatePolicy(policy);
   }
@@ -155,18 +139,8 @@ export class FederationNetwork implements FederationNetworking {
     if (this.onionService) validateFederationOnionService(this.onionService);
     if (policy.enabled && !policy.directOrigin)
       fail("invalid-data", "Direct networking requires a public HTTPS origin");
-    if (
-      policy.bootstrapOrigins &&
-      (!Array.isArray(policy.bootstrapOrigins) || policy.bootstrapOrigins.length > 16)
-    )
-      fail("invalid-data", "Configure at most 16 HTTPS bootstrap origins");
-    if (policy.bootstrapOrigins?.length && !this.bootstrapStorage)
-      fail("invalid-data", "HTTPS bootstrap configuration requires durable bootstrap storage");
     return {
       enabled: policy.enabled,
-      bootstrapOrigins: [
-        ...new Set((policy.bootstrapOrigins ?? []).map(normalizeFederationDirectOrigin)),
-      ],
       ...(policy.directOrigin
         ? { directOrigin: normalizeFederationDirectOrigin(policy.directOrigin) }
         : {}),
@@ -181,25 +155,10 @@ export class FederationNetwork implements FederationNetworking {
       new FederationError("unavailable", "Direct networking policy changed", true),
     );
     this.generation = new AbortController();
-    this.cache.clear();
-    this.pending.clear();
-    this.bootstrapRefresh.clear();
+    this.failures.clear();
+    this.archiveEndpoints.clear();
     for (const socket of this.sockets) socket.destroy();
     this.sockets.clear();
-  }
-
-  describe(request: unknown): FederationNetworkingDescriptor {
-    const challenge = federationNetworkingChallenge(request);
-    if (this.closed || !this.onionService)
-      fail("unavailable", "Federation onion identity is unavailable");
-    return {
-      type: "unolock.federation.networking.v1",
-      onionService: this.onionService,
-      enabled: this.policy.enabled,
-      challenge,
-      expiresAt: Date.now() + federationNetworkingLeaseMs,
-      ...(this.policy.enabled ? { directOrigin: this.policy.directOrigin! } : {}),
-    };
   }
 
   private operation(signal?: AbortSignal) {
@@ -226,30 +185,6 @@ export class FederationNetwork implements FederationNetworking {
     validateFederationOnionService(onionService);
     const op = this.operation(options.signal);
     try {
-      if (this.policy.enabled) {
-        const generation = this.generation.signal;
-        try {
-          const directSignal = AbortSignal.any([op.signal, generation]);
-          const descriptor = await this.discover(onionService, directSignal);
-          if (descriptor?.enabled && this.policy.enabled) {
-            const socket = await this.openDirect(descriptor.directOrigin!, directSignal);
-            if (directSignal.aborted) {
-              socket.destroy();
-              directSignal.throwIfAborted();
-            }
-            return {
-              socket,
-              transport: "direct",
-              origin: descriptor.directOrigin!,
-              pathPrefix: federationDirectPathPrefix,
-            };
-          }
-        } catch {
-          op.signal.throwIfAborted();
-          if (!generation.aborted) this.reportFailure(onionService);
-        }
-      }
-      op.signal.throwIfAborted();
       const socket = await this.tor!.connect(onionService, op.signal);
       if (op.signal.aborted) {
         socket.destroy();
@@ -261,132 +196,67 @@ export class FederationNetwork implements FederationNetworking {
     }
   }
 
-  async bootstrap(
-    origin: string,
-    options: { signal?: AbortSignal } = {},
-  ): Promise<{ onionService: string }> {
-    origin = normalizeFederationDirectOrigin(origin);
-    const op = this.operation(options.signal);
-    const signal = AbortSignal.any([op.signal, this.generation.signal]);
+  acceptTorArchiveEndpoint(onionService: string, value: unknown): void {
+    if (this.closed) return;
+    validateFederationOnionService(onionService);
+    this.archiveEndpoints.delete(onionService);
+    if (value === undefined || value === onionService) return;
+    let origin: string;
     try {
-      if (!this.policy.enabled) {
-        const retained = await abortable(
-          this.bootstrapStorage?.get(origin) ?? Promise.resolve(undefined),
-          signal,
-        );
-        signal.throwIfAborted();
-        if (retained) return { onionService: validateFederationOnionService(retained) };
-        fail("unauthorized", "Unknown HTTPS bootstrap requires direct networking to be enabled");
+      origin = normalizeFederationDirectOrigin(value);
+    } catch {
+      return;
+    }
+    if (this.archiveEndpoints.size >= 512)
+      this.archiveEndpoints.delete(this.archiveEndpoints.keys().next().value!);
+    this.archiveEndpoints.set(onionService, { origin, until: Date.now() + 5 * 60_000 });
+  }
+
+  async connectArchive(
+    onionService: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<FederationNetworkConnection> {
+    validateFederationOnionService(onionService);
+    const endpoint = this.archiveEndpoints.get(onionService);
+    if (
+      !this.enabled ||
+      !endpoint ||
+      endpoint.until <= Date.now() ||
+      (this.failures.get(onionService) ?? 0) > Date.now()
+    )
+      return this.connect(onionService, options);
+    const op = this.operation(options.signal);
+    try {
+      const generation = this.generation.signal;
+      const signal = AbortSignal.any([op.signal, generation]);
+      try {
+        const socket = await this.openDirect(endpoint.origin, signal);
+        if (signal.aborted) {
+          socket.destroy();
+          signal.throwIfAborted();
+        }
+        return {
+          socket,
+          transport: "direct",
+          origin: endpoint.origin,
+          pathPrefix: federationDirectPathPrefix,
+        };
+      } catch {
+        op.signal.throwIfAborted();
+        if (!generation.aborted) this.reportFailure(onionService);
       }
-      const challenge = randomBytes(32).toString("base64url");
-      const socket = await this.openDirect(origin, signal);
-      const introduction = validateFederationNetworkingDescriptor(
-        await this.readDescriptor(socket, origin, federationDirectPathPrefix, challenge, signal),
-        { challenge },
-      );
-      if (!introduction.enabled || introduction.directOrigin !== origin)
-        fail("unauthorized", "HTTPS bootstrap does not advertise this origin");
-      const verified = await this.discover(introduction.onionService, signal, true);
-      signal.throwIfAborted();
-      if (!verified?.enabled || verified.directOrigin !== origin)
-        fail("unauthorized", "HTTPS bootstrap does not match its onion identity");
-      await this.bootstrapStorage?.set(origin, verified.onionService, { signal });
-      signal.throwIfAborted();
-      return { onionService: verified.onionService };
     } finally {
       op.done();
     }
-  }
-
-  async bootstrapPeers(
-    options: { signal?: AbortSignal } = {},
-  ): Promise<{ onionService: string }[]> {
-    if (!this.policy.bootstrapOrigins?.length) return [];
-    const op = this.operation(options.signal);
-    try {
-      const peers = await Promise.all(
-        (this.policy.bootstrapOrigins ?? []).map(async (origin) => {
-          const retained = await abortable(this.bootstrapStorage!.get(origin), op.signal);
-          op.signal.throwIfAborted();
-          const fallback = retained
-            ? { onionService: validateFederationOnionService(retained) }
-            : undefined;
-          let pending = this.bootstrapPending.get(origin);
-          if (!this.enabled || (!pending && (this.bootstrapRefresh.get(origin) ?? 0) > Date.now()))
-            return fallback;
-          if (!pending) {
-            this.bootstrapRefresh.set(origin, Date.now() + 30_000);
-            pending = this.bootstrap(origin)
-              .then((peer) => {
-                this.bootstrapRefresh.set(origin, Date.now() + federationNetworkingLeaseMs);
-                return peer;
-              })
-              .finally(() => this.bootstrapPending.delete(origin));
-            this.bootstrapPending.set(origin, pending);
-          }
-          return abortable(pending, op.signal).catch(() => fallback);
-        }),
-      );
-      op.signal.throwIfAborted();
-      return [
-        ...new Map(
-          peers.filter((peer) => peer !== undefined).map((peer) => [peer.onionService, peer]),
-        ).values(),
-      ];
-    } finally {
-      op.done();
-    }
-  }
-
-  private remember(onion: string, descriptor?: FederationNetworkingDescriptor): void {
-    if (!this.cache.has(onion) && this.cache.size >= 512)
-      this.cache.delete(this.cache.keys().next().value!);
-    this.cache.set(onion, { descriptor, until: descriptor?.expiresAt ?? Date.now() + 30_000 });
+    // No application bytes were sent. Later retries belong to the operation owner.
+    return this.connect(onionService, options);
   }
 
   reportFailure(onionService: string): void {
     validateFederationOnionService(onionService);
-    this.remember(onionService);
-  }
-
-  private async discover(
-    onion: string,
-    signal: AbortSignal,
-    fresh = false,
-  ): Promise<FederationNetworkingDescriptor | undefined> {
-    const cached = this.cache.get(onion);
-    if (!fresh && cached && cached.until > Date.now()) return cached.descriptor;
-    // A shared probe has its own lifetime; one caller's cancellation must not poison other callers.
-    const existing = this.pending.get(onion);
-    if (existing) return abortable(existing, signal);
-    if (this.pending.size >= 32) return undefined;
-    const generation = this.generation.signal;
-    const probeSignal = AbortSignal.any([generation, AbortSignal.timeout(15_000)]);
-    const probe = (async () => {
-      const challenge = randomBytes(32).toString("base64url");
-      try {
-        const socket = await this.tor!.connect(onion, probeSignal);
-        if (probeSignal.aborted) {
-          socket.destroy();
-          probeSignal.throwIfAborted();
-        }
-        const descriptor = validateFederationNetworkingDescriptor(
-          await this.readDescriptor(socket, onion, "", challenge, probeSignal),
-          { onionService: onion, challenge },
-        );
-        probeSignal.throwIfAborted();
-        this.remember(onion, descriptor);
-        return descriptor;
-      } catch {
-        if (!probeSignal.aborted) this.remember(onion);
-        return undefined;
-      }
-    })();
-    this.pending.set(onion, probe);
-    void probe.finally(() => {
-      if (this.pending.get(onion) === probe) this.pending.delete(onion);
-    });
-    return abortable(probe, signal);
+    if (!this.failures.has(onionService) && this.failures.size >= 512)
+      this.failures.delete(this.failures.keys().next().value!);
+    this.failures.set(onionService, Date.now() + 30_000);
   }
 
   private async openDirect(origin: string, signal: AbortSignal): Promise<Socket> {
@@ -464,78 +334,13 @@ export class FederationNetwork implements FederationNetworking {
     }
   }
 
-  private readDescriptor(
-    socket: Socket,
-    origin: string,
-    prefix: string,
-    challenge: string,
-    signal: AbortSignal,
-  ): Promise<unknown> {
-    const body = Buffer.from(
-      JSON.stringify({ type: "unolock.federation.networking.request.v1", challenge }),
-    );
-    const agent = new Agent({ keepAlive: false });
-    agent.createConnection = (() => socket) as typeof agent.createConnection;
-    const url = new URL(origin);
-    return new Promise<unknown>((resolve, reject) => {
-      const req = request(
-        {
-          hostname: url.hostname,
-          port: Number(url.port || (url.protocol === "https:" ? 443 : 80)),
-          path: prefix + federationNetworkingPath,
-          method: "POST",
-          agent,
-          signal,
-          maxHeaderSize: 8192,
-          headers: {
-            "content-type": "application/json",
-            accept: "application/json",
-            "content-length": body.byteLength,
-            connection: "close",
-          },
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          let bytes = 0;
-          res.on("data", (chunk: Buffer) => {
-            bytes += chunk.length;
-            if (bytes > federationNetworkingMaxBytes)
-              res.destroy(
-                new FederationError("limit-exceeded", "Networking descriptor is too large"),
-              );
-            else chunks.push(chunk);
-          });
-          res.once("error", reject);
-          res.once("end", () => {
-            try {
-              if (res.statusCode !== 200 || !res.complete)
-                fail("unavailable", "Networking descriptor is unavailable");
-              resolve(
-                JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))),
-              );
-            } catch (error) {
-              reject(error);
-            }
-          });
-        },
-      );
-      req.once("error", reject);
-      req.once("socket", (connected) => connected.resume());
-      req.end(body);
-    }).finally(() => {
-      socket.destroy();
-      agent.destroy();
-    });
-  }
-
   async stop(): Promise<void> {
     this.closed = true;
     this.generation.abort();
     for (const operation of this.active) operation.abort();
     for (const socket of this.sockets) socket.destroy();
-    await Promise.allSettled([...this.pending.values()]);
-    this.pending.clear();
-    this.cache.clear();
+    this.failures.clear();
+    this.archiveEndpoints.clear();
   }
 
   resume(): void {

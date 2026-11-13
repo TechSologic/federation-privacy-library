@@ -77,7 +77,6 @@ export class FederationFacade {
       config.tor?.onionService,
       config.transport?.onion ?? runtimeTor,
       config.networking,
-      storage.bootstrap,
     );
     this.network = this.networking;
     const atomic = [storage.addresses, storage.state, storage.lease, storage.commit];
@@ -152,7 +151,6 @@ export class FederationFacade {
         localLookup: storage.lookup,
         rpcClient: this.rpc!,
         bootstrapPeers: [...(config.tor?.bootstrap ?? [])],
-        directBootstrapPeers: (signal) => this.network.bootstrapPeers({ signal }),
         localOnionService: config.tor?.onionService,
         publishQueue: storage.publications,
         maxRetryBatch: this.batch,

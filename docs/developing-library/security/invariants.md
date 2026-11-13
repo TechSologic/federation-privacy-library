@@ -21,8 +21,9 @@ independent security review already establish them.
 6. DHT bootstrap peers are introductions, not identity authorities. An incomplete
    lookup is not evidence that an address does not exist.
 7. Tor and each node's onion identity remain mandatory. Direct HTTPS is eligible
-   only under explicit local opt-in and a fresh remote capability authenticated
-   through that exact onion endpoint. Otherwise use Tor. Never silently enable
+   only for archive bytes under explicit local opt-in and a recent endpoint
+   advertisement received through that exact onion service. DHT, lookup, messages
+   and archive controls always use Tor. Never silently enable
    direct networking, follow redirects, or resolve direct DNS in Tor-only mode.
    Direct mode adds public HTTPS certificate-authority trust and reveals network
    metadata; it does not change membership, routing IDs or client authority.

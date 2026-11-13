@@ -87,8 +87,8 @@ onion service, local listener, SOCKS endpoint, and bootstrap peers. Both local
 sockets must be loopback addresses. Startup checks the SOCKS service and reports
 degraded readiness if it is unavailable; this check does not prove an onion
 descriptor is already reachable everywhere. Optional [Direct Networking](direct-networking.md)
-selects HTTPS only when both nodes enable it and the remote onion endpoint
-authenticates its current capability. Tor-only mode never opens direct sockets.
+selects HTTPS only for archive bytes using endpoints learned from existing Tor
+responses. Tor-only mode never opens direct sockets.
 Redirects are not followed.
 
 Supply one `storage` provider object. For the built-in runtime, implement its
@@ -329,7 +329,8 @@ override the built-in runtime's SOCKS connector.
 - `transport.lookup` and `transport.delivery` provide finite Tor I/O, reject
   redirects, and enforce response/custody bounds. They do not implement scheduling.
   To enable direct mode, supply a Tor-only `transport.onion` connector and use
-  `network.connect` in every host transport, including archive paths; see the
+  `network.connect` for Tor controls/messages and `network.connectArchive`
+  for archive bytes; see the
   [network integration contract](direct-networking.md#configuration-and-ownership).
 - `handlers.isAddressActive` supplies application address policy;
   `preparePublications` performs an eligibility sweep before publication.

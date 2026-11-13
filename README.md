@@ -163,8 +163,8 @@ the application; the federation transports their encrypted data.
 ## Privacy And Independent Operation
 
 Federation traffic uses Tor onion services by default. Optional
-[Direct Networking](docs/using-library/direct-networking.md) uses HTTPS between
-opted-in peers while retaining mandatory Tor and shared federation membership.
+[Direct Networking](docs/using-library/direct-networking.md) uses HTTPS for archive bytes, including large message attachments, using the
+endpoint learned from ordinary Tor responses. DHT, lookup and messages stay on Tor.
 Direct networking reveals network metadata and domain/onion linkage.
 Tor provides network-layer privacy;
 it does not replace content encryption, recipient-key verification, or access

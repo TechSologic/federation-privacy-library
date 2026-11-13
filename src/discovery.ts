@@ -39,9 +39,6 @@ export class Discovery {
     readonly bootstrap: readonly { onionService: string }[],
     readonly wire: HttpWire,
     readonly state: State,
-    private readonly directBootstrapPeers?: (
-      signal: AbortSignal,
-    ) => Promise<{ onionService: string }[]>,
   ) {
     this.table = new DhtRoutingTable(nodeId(endpoint));
     if (bootstrap.length > 64) fail("limit-exceeded", "Too many bootstrap peers");
@@ -52,10 +49,9 @@ export class Discovery {
     if (endpoint !== this.endpoint && this.candidates.size < 128) this.candidates.add(endpoint);
   }
   async seeds(target: string, signal: AbortSignal): Promise<DhtContact[]> {
-    const direct = (await this.directBootstrapPeers?.(signal)) ?? [];
     return [
       ...this.table.closest(target, 20),
-      ...[...this.bootstrap, ...direct].map((peer) => ({
+      ...this.bootstrap.map((peer) => ({
         id: nodeId(peer.onionService),
         endpoint: peer.onionService,
       })),
